@@ -13,8 +13,8 @@
     "echarts": "^6.0.0",
     "echarts-gl": "^2.0.9",
     "lucide-react": "^0.468.0",
-    "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^5.0.0",
