@@ -28,7 +28,7 @@ statrs = "0.18"
 thiserror = "2.0"
 time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
 tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
-tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
+tower-http = { version = "0.7", features = ["cors", "fs", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
