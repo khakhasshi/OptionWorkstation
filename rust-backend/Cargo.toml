@@ -24,7 +24,7 @@ rust_decimal = "1.39"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
-statrs = "0.18"
+statrs = "0.19"
 thiserror = "2.0"
 time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
 tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
