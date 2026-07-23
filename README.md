@@ -1,5 +1,16 @@
 # Option Workstation
 
+[![Rust](https://img.shields.io/badge/Rust-2024-000000?logo=rust&logoColor=white)](rust-backend/Cargo.toml)
+[![Axum](https://img.shields.io/badge/Axum-0.8-2f855a)](rust-backend/Cargo.toml)
+[![Tokio](https://img.shields.io/badge/Tokio-1.x-3b82f6)](rust-backend/Cargo.toml)
+[![React](https://img.shields.io/badge/React-19-61dafb?logo=react&logoColor=111111)](frontend/package.json)
+[![Vite](https://img.shields.io/badge/Vite-7-646cff?logo=vite&logoColor=white)](frontend/package.json)
+[![ECharts](https://img.shields.io/badge/ECharts-6-aa344d)](frontend/package.json)
+[![Longbridge](https://img.shields.io/badge/Longbridge-Rust%20SDK-00b386)](docs/DATA_SOURCES.md)
+[![ThetaData](https://img.shields.io/badge/ThetaData-Parquet-4b5563)](docs/DATA_SOURCES.md)
+[![Docker](https://img.shields.io/badge/Docker-ready-2496ed?logo=docker&logoColor=white)](Dockerfile)
+[![License](https://img.shields.io/badge/License-Apache--2.0-blue)](LICENSE)
+
 一个面向期权研究者和交易员的本地工作台，把历史逐帧回放、实时期权链、
 隐含波动率研究、Dealer Exposure、组合风险预览和可审计决策记录放在同一屏幕。
 项目以数据来源透明、计算可复现和风险边界可见为首要原则。
