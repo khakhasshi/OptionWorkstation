@@ -17,7 +17,7 @@
 
 [English](README.en.md) · [新手指南](frontend/public/guide.html) ·
 [系统架构](docs/ARCHITECTURE.md) · [数据规范](docs/DATA_SOURCES.md) ·
-[安全策略](SECURITY.md)
+[示例数据](docs/EXAMPLE_DATA.md) · [安全策略](SECURITY.md)
 
 维护者：[JIANGJINGZHE（江景哲）](mailto:jiangjingzhe2004@gmail.com) ·
 [WhatsApp](https://wa.me/85268515553)

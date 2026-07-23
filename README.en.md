@@ -16,7 +16,7 @@ workstation.
 
 [中文说明](README.md) · [Beginner guide](frontend/public/guide.html) ·
 [Architecture](docs/ARCHITECTURE.md) · [Data contract](docs/DATA_SOURCES.md) ·
-[Security](SECURITY.md)
+[Example data](docs/EXAMPLE_DATA.md) · [Security](SECURITY.md)
 
 Maintainer: [JIANGJINGZHE (Jiang Jingzhe / 江景哲)](mailto:jiangjingzhe2004@gmail.com) ·
 [WhatsApp](https://wa.me/85268515553)
