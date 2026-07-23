@@ -11,7 +11,7 @@ publish = false
 anyhow = "1.0"
 arrow-array = "59.1"
 axum = { version = "0.8.9", features = ["ws"] }
-base64 = "0.22"
+base64 = "0.23"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 dashmap = "6.1"
