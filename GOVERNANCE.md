@@ -18,6 +18,11 @@ When consensus is not immediate, decisions should favor:
 4. compatibility with existing replay evidence;
 5. implementation simplicity.
 
-The maintainer list and escalation contact should be added when the public
-repository owner is finalized. Until then, no contributor should claim to speak
-for the project without maintainer approval.
+## Maintainer
+
+- JIANGJINGZHE (Jiang Jingzhe / 江景哲)
+- Email: <jiangjingzhe2004@gmail.com>
+
+No contributor should claim to speak for the project without maintainer
+approval. Repository ownership may change without transferring responsibility
+for provider data licenses, brokerage accounts, or trading outcomes.

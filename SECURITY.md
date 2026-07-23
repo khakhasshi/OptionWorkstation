@@ -16,8 +16,8 @@ and the most recent tagged release only.
 Do not open a public issue for a vulnerability.
 
 After the repository is published, use GitHub Private Vulnerability Reporting
-from the repository Security tab. Before that feature is enabled, contact the
-maintainer privately through the account that publishes the repository.
+from the repository Security tab. Before that feature is enabled, email
+<jiangjingzhe2004@gmail.com> with the subject `Option Workstation Security`.
 
 Include:
 

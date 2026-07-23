@@ -12,6 +12,8 @@ and releases use semantic versioning after the public API stabilizes.
 - Independent Option Workstation repository structure.
 - Rust replay/live analytics server and React workstation.
 - Chinese beginner guide and decision-support walkthrough.
+- Chinese-first project README with a detailed capability map, operating
+  workflow, local API reference, and maintainer contact.
 - Reproducible local and container startup paths.
 - Open-source governance, security, contribution, CI, and release standards.
 
