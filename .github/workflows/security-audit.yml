@@ -1,0 +1,35 @@
+name: Security Audit
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "rust-backend/Cargo.toml"
+      - "rust-backend/Cargo.lock"
+      - "vendor/longbridge-oauth/**"
+      - ".github/workflows/security-audit.yml"
+  pull_request:
+    paths:
+      - "rust-backend/Cargo.toml"
+      - "rust-backend/Cargo.lock"
+      - "vendor/longbridge-oauth/**"
+      - ".github/workflows/security-audit.yml"
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  checks: write
+  issues: write
+
+jobs:
+  rustsec:
+    name: RustSec Advisory Database
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          working-directory: rust-backend

@@ -1,0 +1,41 @@
+name: Feature request
+description: Propose a scoped research, usability, or reliability improvement.
+title: "[Feature]: "
+labels: ["enhancement", "triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user decision or engineering risk is hard today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: provenance
+    attributes:
+      label: Data and model assumptions
+      description: Describe new inputs, timestamps, quality gates, and model claims.
+  - type: textarea
+    id: safety
+    attributes:
+      label: Safety and failure behavior
+      description: Explain stale, missing, provider-failure, and order-safety states.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope confirmation
+      options:
+        - label: This request does not require real-money order submission.
+          required: true

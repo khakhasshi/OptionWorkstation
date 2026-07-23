@@ -1,0 +1,68 @@
+name: Data quality or model report
+description: Report stale, missing, mislabeled, or inconsistent analytics.
+title: "[Data]: "
+labels: ["data-quality", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe provenance and statistics, not provider-owned raw rows. Never post account-linked data.
+  - type: dropdown
+    id: source
+    attributes:
+      label: Source
+      options:
+        - ThetaData replay
+        - Longbridge live
+        - Synthetic fixture
+        - Unknown
+    validations:
+      required: true
+  - type: input
+    id: context
+    attributes:
+      label: Redacted market context
+      placeholder: SPY, 2026-07-10 10:30 ET, 0DTE
+    validations:
+      required: true
+  - type: dropdown
+    id: panel
+    attributes:
+      label: Affected output
+      options:
+        - Chain or quote quality
+        - IV or Greeks
+        - SVI or smile
+        - Surface constraints
+        - IV Rank, RV, VRP, or expected move
+        - GEX, vanna, charm, or walls
+        - Strategy risk
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: provenance
+    attributes:
+      label: Provenance and availability
+      description: Include timestamp, timezone, sample count, freshness, and schema where known.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected interpretation
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual interpretation
+    validations:
+      required: true
+  - type: checkboxes
+    id: rights
+    attributes:
+      label: Data rights
+      options:
+        - label: I have not attached restricted market data or account-linked information.
+          required: true

@@ -1,0 +1,785 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Option Workstation 初学者使用指南：从数据质量、波动率和偏斜，到策略结构、风险预览与复盘。">
+  <link rel="icon" href="data:,">
+  <title>Option Workstation 初学者指南</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: #dce5ec;
+      background: #0b1014;
+      font-synthesis: none;
+      letter-spacing: 0;
+      --bg: #0b1014;
+      --panel: #0f171d;
+      --panel-strong: #131d24;
+      --line: #25323b;
+      --line-soft: #1b262e;
+      --text: #dce5ec;
+      --muted: #82909b;
+      --quiet: #61717d;
+      --mint: #54d6b6;
+      --blue: #70a5ff;
+      --amber: #f1c75b;
+      --red: #ff7e8a;
+      --violet: #b395ff;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; scroll-padding-top: 74px; }
+    body { margin: 0; min-width: 320px; min-height: 100vh; background: var(--bg); color: var(--text); }
+    button, select, input { font: inherit; letter-spacing: 0; }
+    a { color: inherit; }
+    button, a.button { cursor: pointer; }
+    button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible {
+      outline: 2px solid var(--blue);
+      outline-offset: 2px;
+    }
+
+    .skip-link {
+      position: fixed;
+      left: 12px;
+      top: -60px;
+      z-index: 20;
+      padding: 9px 12px;
+      background: var(--mint);
+      color: #07110e;
+      text-decoration: none;
+    }
+    .skip-link:focus { top: 8px; }
+
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      height: 54px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      padding: 0 18px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(11, 16, 20, 0.96);
+      backdrop-filter: blur(12px);
+    }
+    .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
+    .brand-mark { color: var(--mint); font-size: 23px; line-height: 1; }
+    .brand strong { font-size: 14px; white-space: nowrap; }
+    .brand span { padding-left: 10px; border-left: 1px solid var(--line); color: var(--muted); font-size: 11px; white-space: nowrap; }
+    .top-actions { display: flex; align-items: center; gap: 7px; }
+    .button, button {
+      min-height: 31px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      padding: 0 11px;
+      border: 1px solid #33424d;
+      border-radius: 4px;
+      background: #121b21;
+      color: #c7d1d8;
+      font-size: 11px;
+      text-decoration: none;
+    }
+    .button.primary { border-color: #348b77; background: #226d5e; color: #f2fffb; }
+    .progress { position: fixed; z-index: 12; top: 53px; left: 0; width: 0; height: 2px; background: var(--mint); }
+
+    .page {
+      width: min(1480px, 100%);
+      margin: 0 auto;
+      display: grid;
+      grid-template-columns: 230px minmax(0, 1fr);
+      gap: 34px;
+      padding: 28px 28px 80px;
+    }
+    .toc {
+      position: sticky;
+      top: 82px;
+      align-self: start;
+      max-height: calc(100vh - 104px);
+      overflow: auto;
+      border-right: 1px solid var(--line);
+      padding-right: 22px;
+    }
+    .toc strong { display: block; margin-bottom: 12px; color: #aebbc4; font-size: 10px; text-transform: uppercase; }
+    .toc a {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      min-height: 34px;
+      color: var(--muted);
+      font-size: 12px;
+      text-decoration: none;
+    }
+    .toc a:hover, .toc a.active { color: var(--mint); }
+    .toc i { width: 22px; color: var(--quiet); font-style: normal; font-variant-numeric: tabular-nums; }
+
+    main { min-width: 0; }
+    .intro {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(280px, 390px);
+      gap: 28px;
+      align-items: end;
+      padding: 4px 0 30px;
+      border-bottom: 1px solid var(--line);
+    }
+    .eyebrow { display: block; margin-bottom: 9px; color: var(--mint); font-size: 10px; font-weight: 750; text-transform: uppercase; }
+    h1, h2, h3 { margin: 0; letter-spacing: 0; }
+    h1 { max-width: 760px; font-size: 38px; line-height: 1.16; }
+    .intro p { max-width: 740px; margin: 15px 0 0; color: #9aa8b2; font-size: 15px; line-height: 1.75; }
+    .notice {
+      padding: 15px 16px;
+      border-left: 3px solid var(--amber);
+      background: #1b1912;
+      color: #cfc49b;
+      font-size: 12px;
+      line-height: 1.65;
+    }
+    .notice strong { display: block; margin-bottom: 4px; color: var(--amber); }
+
+    section { padding: 34px 0; border-bottom: 1px solid var(--line); }
+    .section-heading { display: flex; align-items: end; justify-content: space-between; gap: 24px; margin-bottom: 18px; }
+    h2 { font-size: 23px; }
+    h3 { font-size: 15px; }
+    .section-heading p, .section-copy { max-width: 700px; margin: 0; color: var(--muted); font-size: 12px; line-height: 1.7; }
+
+    .quick-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      border: 1px solid var(--line);
+    }
+    .quick-step { min-height: 132px; padding: 17px; border-right: 1px solid var(--line); background: var(--panel); }
+    .quick-step:last-child { border-right: 0; }
+    .quick-step b { display: block; margin-bottom: 17px; color: var(--mint); font-size: 11px; }
+    .quick-step strong { display: block; margin-bottom: 8px; font-size: 13px; }
+    .quick-step p { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.6; }
+
+    figure { margin: 0; }
+    .screen {
+      position: relative;
+      overflow: hidden;
+      border: 1px solid #31404a;
+      background: #080c0f;
+    }
+    .screen img { display: block; width: 100%; height: auto; }
+    .marker {
+      position: absolute;
+      width: 27px;
+      height: 27px;
+      display: grid;
+      place-items: center;
+      border: 2px solid #07110e;
+      border-radius: 50%;
+      background: var(--mint);
+      color: #07110e;
+      font-size: 11px;
+      font-weight: 800;
+      box-shadow: 0 0 0 2px rgba(84, 214, 182, 0.34);
+    }
+    .m1 { left: 80%; top: 2%; }
+    .m2 { left: 30%; top: 17%; }
+    .m3 { left: 62%; top: 15%; }
+    .m4 { left: 85%; top: 16%; }
+    .m5 { left: 20%; top: 43%; }
+    .m6 { left: 72%; top: 43%; }
+    .m7 { left: 25%; top: 74%; }
+    .m8 { left: 63%; top: 74%; }
+    .m9 { left: 87%; top: 95%; }
+    figcaption { padding: 10px 0 0; color: var(--quiet); font-size: 10px; }
+    .legend-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      margin-top: 14px;
+      border-top: 1px solid var(--line);
+      border-left: 1px solid var(--line);
+    }
+    .legend-item { min-height: 72px; display: grid; grid-template-columns: 27px 1fr; gap: 9px; padding: 12px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+    .legend-item b { width: 23px; height: 23px; display: grid; place-items: center; border-radius: 50%; background: #193b35; color: var(--mint); font-size: 10px; }
+    .legend-item strong { display: block; margin-bottom: 4px; font-size: 11px; }
+    .legend-item span { color: var(--muted); font-size: 10px; line-height: 1.45; }
+
+    .gate-table, .metric-table, .strategy-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+    th { height: 35px; padding: 0 11px; border: 1px solid var(--line); background: var(--panel-strong); color: var(--muted); font-weight: 650; text-align: left; }
+    td { padding: 11px; border: 1px solid var(--line); color: #b8c4cc; line-height: 1.55; vertical-align: top; }
+    td:first-child { color: #d8e2e8; font-weight: 650; white-space: nowrap; }
+    .good { color: var(--mint); }
+    .warn { color: var(--amber); }
+    .bad { color: var(--red); }
+    .info { color: var(--blue); }
+
+    .decision-flow { border-top: 1px solid var(--line); }
+    .decision-step { display: grid; grid-template-columns: 52px 180px minmax(0, 1fr) 230px; gap: 16px; align-items: center; min-height: 92px; border-bottom: 1px solid var(--line); }
+    .decision-step > b { color: var(--mint); font-size: 20px; font-variant-numeric: tabular-nums; }
+    .decision-step h3 { margin-bottom: 5px; }
+    .decision-step p { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.55; }
+    .decision-step .answer { padding: 10px 12px; border-left: 2px solid var(--blue); background: #101820; color: #aebdca; font-size: 10px; line-height: 1.55; }
+
+    .lab {
+      display: grid;
+      grid-template-columns: minmax(300px, 0.9fr) minmax(0, 1.1fr);
+      border: 1px solid var(--line);
+      background: var(--panel);
+    }
+    .lab-controls { padding: 18px; border-right: 1px solid var(--line); }
+    .lab-output { min-height: 480px; padding: 18px; background: #0d151a; }
+    .control-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    label { display: grid; gap: 6px; color: var(--muted); font-size: 10px; }
+    select, input {
+      width: 100%;
+      height: 34px;
+      padding: 0 9px;
+      border: 1px solid #30404a;
+      border-radius: 3px;
+      background: #0c1318;
+      color: #d1dce3;
+    }
+    .lab-controls h3, .lab-output h3 { margin-bottom: 14px; }
+    .risk-line { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; margin-top: 13px; }
+    .risk-value { min-height: 62px; padding: 9px; border: 1px solid var(--line-soft); background: #101920; }
+    .risk-value span { display: block; margin-bottom: 6px; color: var(--quiet); font-size: 9px; }
+    .risk-value strong { font-size: 15px; }
+    .lab-disclaimer { margin: 13px 0 0; color: var(--quiet); font-size: 9px; line-height: 1.5; }
+    .output-head { padding-bottom: 14px; border-bottom: 1px solid var(--line); }
+    .output-head span { color: var(--muted); font-size: 10px; }
+    .output-head strong { display: block; margin-top: 5px; color: var(--mint); font-size: 18px; }
+    .output-block { padding: 14px 0; border-bottom: 1px solid var(--line-soft); }
+    .output-block:last-child { border-bottom: 0; }
+    .output-block b { display: block; margin-bottom: 7px; color: #9caab4; font-size: 10px; text-transform: uppercase; }
+    .output-block p { margin: 0; color: #c6d1d8; font-size: 11px; line-height: 1.65; }
+    .structure-list { display: flex; flex-wrap: wrap; gap: 6px; }
+    .structure-list span { padding: 5px 7px; border: 1px solid #356658; border-radius: 3px; background: #10221f; color: #74ddc2; font-size: 10px; }
+
+    .example {
+      display: grid;
+      grid-template-columns: 230px minmax(0, 1fr);
+      border: 1px solid var(--line);
+    }
+    .example-summary { padding: 18px; border-right: 1px solid var(--line); background: #111a20; }
+    .example-summary strong { display: block; margin-bottom: 7px; font-size: 21px; }
+    .example-summary span { color: var(--muted); font-size: 10px; }
+    .example-reading { display: grid; grid-template-columns: 1fr 1fr; }
+    .example-reading div { min-height: 96px; padding: 13px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+    .example-reading div:nth-child(even) { border-right: 0; }
+    .example-reading div:nth-last-child(-n + 2) { border-bottom: 0; }
+    .example-reading b { display: block; margin-bottom: 6px; font-size: 11px; }
+    .example-reading p { margin: 0; color: var(--muted); font-size: 10px; line-height: 1.55; }
+
+    .workflow-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+    .workflow { border-top: 3px solid var(--blue); background: var(--panel); }
+    .workflow.live { border-top-color: var(--mint); }
+    .workflow h3 { padding: 14px; border-bottom: 1px solid var(--line); }
+    .workflow ol { margin: 0; padding: 8px 18px 16px 38px; }
+    .workflow li { padding: 7px 0; color: #aebac3; font-size: 11px; line-height: 1.55; }
+
+    .red-flags { display: grid; grid-template-columns: 1fr 1fr; border-top: 1px solid var(--line); border-left: 1px solid var(--line); }
+    .flag { min-height: 82px; padding: 13px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+    .flag b { display: block; margin-bottom: 6px; color: var(--red); font-size: 11px; }
+    .flag span { color: var(--muted); font-size: 10px; line-height: 1.5; }
+
+    .glossary { columns: 3; column-gap: 26px; }
+    .term { break-inside: avoid; padding: 10px 0; border-bottom: 1px solid var(--line-soft); }
+    .term dt { margin-bottom: 5px; color: #d7e2e8; font-size: 11px; font-weight: 700; }
+    .term dd { margin: 0; color: var(--muted); font-size: 10px; line-height: 1.55; }
+
+    .source-links { display: flex; flex-wrap: wrap; gap: 8px; }
+    .source-links a { padding: 7px 9px; border: 1px solid var(--line); color: #9eabb5; font-size: 10px; text-decoration: none; }
+    .source-links a:hover { border-color: var(--blue); color: var(--blue); }
+    footer { padding: 25px 0 0; color: var(--quiet); font-size: 9px; line-height: 1.6; }
+
+    @media (max-width: 1100px) {
+      .page { grid-template-columns: 190px minmax(0, 1fr); gap: 24px; padding-inline: 20px; }
+      .quick-grid { grid-template-columns: 1fr 1fr; }
+      .quick-step:nth-child(2) { border-right: 0; }
+      .quick-step:nth-child(-n + 2) { border-bottom: 1px solid var(--line); }
+      .legend-grid { grid-template-columns: 1fr 1fr; }
+      .decision-step { grid-template-columns: 44px 150px minmax(0, 1fr); padding: 12px 0; }
+      .decision-step .answer { grid-column: 2 / -1; }
+      .lab { grid-template-columns: 1fr; }
+      .lab-controls { border-right: 0; border-bottom: 1px solid var(--line); }
+    }
+
+    @media (max-width: 760px) {
+      .topbar { padding: 0 10px; }
+      .brand span, .top-actions .print { display: none; }
+      .page { display: block; padding: 18px 12px 60px; }
+      .toc { position: static; max-height: none; display: grid; grid-template-columns: 1fr 1fr; gap: 0 12px; margin-bottom: 24px; padding: 0 0 14px; border-right: 0; border-bottom: 1px solid var(--line); }
+      .toc strong { grid-column: 1 / -1; }
+      .toc a { min-height: 31px; }
+      .intro { grid-template-columns: 1fr; align-items: start; }
+      h1 { font-size: 30px; }
+      .section-heading { display: block; }
+      .section-heading p { margin-top: 9px; }
+      .quick-grid, .legend-grid, .workflow-columns, .red-flags, .example-reading { grid-template-columns: 1fr; }
+      .quick-step { border-right: 0; border-bottom: 1px solid var(--line); }
+      .quick-step:last-child { border-bottom: 0; }
+      .legend-item { min-height: 62px; }
+      .marker { width: 23px; height: 23px; font-size: 9px; }
+      .gate-table, .metric-table, .strategy-table { display: block; overflow-x: auto; white-space: nowrap; }
+      .decision-step { grid-template-columns: 36px minmax(0, 1fr); gap: 10px; }
+      .decision-step > div:nth-child(3), .decision-step .answer { grid-column: 2; }
+      .control-grid { grid-template-columns: 1fr; }
+      .risk-line { grid-template-columns: 1fr 1fr; }
+      .risk-line .risk-value:last-child { grid-column: 1 / -1; }
+      .example { grid-template-columns: 1fr; }
+      .example-summary { border-right: 0; border-bottom: 1px solid var(--line); }
+      .example-reading div { border-right: 0; }
+      .example-reading div:nth-last-child(2) { border-bottom: 1px solid var(--line); }
+      .glossary { columns: 1; }
+    }
+
+    @media print {
+      :root { color-scheme: light; }
+      body { background: #fff; color: #111; }
+      .topbar, .progress, .toc, .lab, .marker { display: none; }
+      .page { display: block; width: 100%; padding: 0; }
+      section { break-inside: avoid; }
+      .screen { border-color: #bbb; }
+      .notice, .quick-step, .workflow, .example-summary { background: #f5f5f5; color: #222; }
+      p, td, .section-copy, .workflow li, .term dd { color: #333 !important; }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip-link" href="#main">跳到正文</a>
+  <div class="progress" id="progress"></div>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">⌁</span>
+      <strong>Option Workstation</strong>
+      <span>初学者指南</span>
+    </div>
+    <div class="top-actions">
+      <button class="print" type="button" onclick="window.print()">打印指南</button>
+      <a class="button primary" href="/?mode=live">返回工作台</a>
+    </div>
+  </header>
+
+  <div class="page">
+    <nav class="toc" aria-label="指南目录">
+      <strong>目录</strong>
+      <a href="#start"><i>01</i>五分钟上手</a>
+      <a href="#map"><i>02</i>界面地图</a>
+      <a href="#data"><i>03</i>数据门禁</a>
+      <a href="#decision"><i>04</i>决策链</a>
+      <a href="#lab"><i>05</i>决策演练</a>
+      <a href="#metrics"><i>06</i>指标解释</a>
+      <a href="#strategy"><i>07</i>策略风险</a>
+      <a href="#example"><i>08</i>截图示例</a>
+      <a href="#workflow"><i>09</i>每日流程</a>
+      <a href="#stop"><i>10</i>停止条件</a>
+      <a href="#glossary"><i>11</i>术语表</a>
+    </nav>
+
+    <main id="main">
+      <div class="intro">
+        <div>
+          <span class="eyebrow">Research first · Paper first</span>
+          <h1>从“看懂数据”到“做出可审计的期权决策”</h1>
+          <p>这套工作台不会替你预测涨跌。它的价值是把行情、IV、偏斜、期限结构、做市商暴露假设、合约流动性和组合风险放在同一时间截面里，帮助你排除不值得交易的机会，并把剩下的假设变成可验证、可复盘的策略。</p>
+        </div>
+        <aside class="notice">
+          <strong>先把它当研究工具</strong>
+          期权可能迅速归零；卖方还可能面临保证金、提前指派和多腿部分成交风险。初学阶段保持纸面执行锁定，只做历史回放和风险预览。
+        </aside>
+      </div>
+
+      <section id="start">
+        <div class="section-heading">
+          <div><span class="eyebrow">Start here</span><h2>第一次打开，只做四件事</h2></div>
+          <p>先建立固定阅读顺序。数据不合格时停止，远比勉强寻找交易理由重要。</p>
+        </div>
+        <div class="quick-grid">
+          <article class="quick-step"><b>01</b><strong>选择模式与标的</strong><p>先用历史模式练习；实时模式一次只观察一个标的。初学时从 SPY 或 QQQ 开始。</p></article>
+          <article class="quick-step"><b>02</b><strong>检查底部状态</strong><p>必须看到 Streaming、合理延迟和足够的 Fresh Quote。OI 不足时不要使用 GEX。</p></article>
+          <article class="quick-step"><b>03</b><strong>形成可证伪假设</strong><p>明确你判断的是方向、波动率还是时间结构，而不是先选策略再寻找解释。</p></article>
+          <article class="quick-step"><b>04</b><strong>预览风险并留痕</strong><p>用可执行 NBBO 检查最大损失、情景矩阵和报价质量，最后保存审计快照。</p></article>
+        </div>
+      </section>
+
+      <section id="map">
+        <div class="section-heading">
+          <div><span class="eyebrow">Workbench map</span><h2>界面地图</h2></div>
+          <p>图中编号对应下方说明。所有图表共享同一标的、同一时刻和同一到期日上下文。</p>
+        </div>
+        <figure>
+          <div class="screen">
+            <img src="/guide/workbench-overview.png" alt="Option Workstation 实时页面全景，包含现货图、期权截面、波动率、IV 微笑、期限结构、暴露、曲面和策略风险面板">
+            <span class="marker m1" title="模式、标的、定价和布局控制">1</span>
+            <span class="marker m2" title="标的价格和成交量">2</span>
+            <span class="marker m3" title="期权截面核心指标">3</span>
+            <span class="marker m4" title="波动率状态">4</span>
+            <span class="marker m5" title="IV 微笑与 SVI">5</span>
+            <span class="marker m6" title="期限结构与 Dealer Exposure">6</span>
+            <span class="marker m7" title="约束 IV 曲面">7</span>
+            <span class="marker m8" title="策略风险引擎">8</span>
+            <span class="marker m9" title="实时数据健康状态">9</span>
+          </div>
+          <figcaption>截图中的价格仅用于讲解，不构成当前行情或交易建议。</figcaption>
+        </figure>
+        <div class="legend-grid">
+          <div class="legend-item"><b>1</b><div><strong>全局控制</strong><span>历史/实时、代码、Micro/Mid/Ask、Dealer 假设和布局。</span></div></div>
+          <div class="legend-item"><b>2</b><div><strong>标的路径</strong><span>先判断趋势、跳空、振幅与成交量，不直接从期权开始。</span></div></div>
+          <div class="legend-item"><b>3</b><div><strong>期权截面</strong><span>ATM IV、RR/BF、PCR、GEX、Gamma Flip 与数据覆盖。</span></div></div>
+          <div class="legend-item"><b>4</b><div><strong>波动率状态</strong><span>把当前隐含波动与同期限历史 IV、实际波动进行比较。</span></div></div>
+          <div class="legend-item"><b>5</b><div><strong>微笑与残差</strong><span>观察行权价间的相对定价，以及市场报价偏离 SVI 的程度。</span></div></div>
+          <div class="legend-item"><b>6</b><div><strong>期限与暴露</strong><span>比较不同到期日的 ATM IV，并观察模型化 Gamma/Vanna/Charm。</span></div></div>
+          <div class="legend-item"><b>7</b><div><strong>IV 曲面</strong><span>同时观察期限与虚实程度；Research 状态不能用于套利断言。</span></div></div>
+          <div class="legend-item"><b>8</b><div><strong>策略风险</strong><span>组合腿、可执行价格、盈亏边界、情景矩阵和风险阻断原因。</span></div></div>
+          <div class="legend-item"><b>9</b><div><strong>健康栏</strong><span>Streaming、Fresh、OI、延迟和质量状态是所有分析的前置门禁。</span></div></div>
+        </div>
+      </section>
+
+      <section id="data">
+        <div class="section-heading">
+          <div><span class="eyebrow">Gate zero</span><h2>先判断这些数据能不能信</h2></div>
+          <p>“有数值”不等于“可使用”。工作台把可用性、时效性和元数据完整度分开显示。</p>
+        </div>
+        <table class="gate-table">
+          <thead><tr><th>检查项</th><th>健康状态</th><th>受限状态</th><th>你的动作</th></tr></thead>
+          <tbody>
+            <tr><td>行情推送</td><td class="good">Streaming</td><td class="bad">Connecting / Reconnecting</td><td>非 Streaming 时不基于实时盘口决策。</td></tr>
+            <tr><td>Fresh Quote</td><td class="good">最好 ≥ 90%</td><td class="warn">&lt; 80%</td><td>低于 80% 时停止依赖 IV、Greeks 和可执行价格。</td></tr>
+            <tr><td>OI 覆盖</td><td class="good">≥ 90%</td><td class="warn">&lt; 90%</td><td>不足时忽略 PCR、GEX、Wall、Gamma Flip 和 Exposure。</td></tr>
+            <tr><td>延迟</td><td class="good">&lt; 3 秒</td><td class="bad">&gt; 5 秒</td><td>延迟过高先等待恢复，尤其不要研究 0DTE。</td></tr>
+            <tr><td>质量状态</td><td class="good">ready</td><td class="warn">waiting_metadata / stale</td><td>阅读具体原因，只使用未被阻断的指标。</td></tr>
+            <tr><td>NBBO</td><td class="good">双边有效、价差合理</td><td class="bad">0/0.01、单边或价差过宽</td><td>出现 invalid NBBO 或 low quote quality 时否决该组合。</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="decision">
+        <div class="section-heading">
+          <div><span class="eyebrow">Decision chain</span><h2>工作台怎样辅助交易决策</h2></div>
+          <p>它不是把指标投票后输出“买/卖”，而是让一个交易假设依次通过七道检查。</p>
+        </div>
+        <div class="decision-flow">
+          <article class="decision-step"><b>01</b><div><h3>数据门禁</h3><p>行情是否新鲜、元数据是否完整？</p></div><div><p>先看底部健康栏和期权截面的 Q/Fresh/Meta。任何后续结论都必须注明数据限制。</p></div><div class="answer">回答：现在是否具备分析和模拟成交的条件？</div></article>
+          <article class="decision-step"><b>02</b><div><h3>价格假设</h3><p>上涨、下跌、震荡还是不确定？</p></div><div><p>用现货路径、成交量和关键跳空形成方向假设。GEX 和 PCR 不能替代方向判断。</p></div><div class="answer">回答：在什么价格路径下，这个想法会被证伪？</div></article>
+          <article class="decision-step"><b>03</b><div><h3>波动率假设</h3><p>实际波动会大于还是小于隐含波动？</p></div><div><p>比较 ATM IV、IV Rank/Percentile、RV20、VRP20 和 Expected Move。</p></div><div class="answer">回答：你是在买方向、买波动、卖波动，还是只利用相对定价？</div></article>
+          <article class="decision-step"><b>04</b><div><h3>相对价值</h3><p>哪一侧、哪一期限更贵？</p></div><div><p>查看 RR、BF、微笑、SVI 残差和期限结构。大残差先排查报价质量。</p></div><div class="answer">回答：策略是否在不必要地购买昂贵翼部？</div></article>
+          <article class="decision-step"><b>05</b><div><h3>结构匹配</h3><p>用哪种组合表达假设？</p></div><div><p>方向明确可研究单腿或垂直价差；预期大波动可研究跨式；震荡且 IV 偏高才研究定义风险卖方结构。</p></div><div class="answer">回答：结构的盈利条件是否与原假设完全一致？</div></article>
+          <article class="decision-step"><b>06</b><div><h3>成交可行性</h3><p>理论机会能否实际成交？</p></div><div><p>检查每条腿的 bid/ask、spread、尺寸、质量和合约身份。风险引擎使用可执行 NBBO，而不是漂亮的中间价。</p></div><div class="answer">回答：加入滑点后，这个机会还存在吗？</div></article>
+          <article class="decision-step"><b>07</b><div><h3>风险与复盘</h3><p>最坏情景是否在预算内？</p></div><div><p>核对 Max Loss、Margin、B/E、到期盈亏线和 3×3×5 情景矩阵，保存快照后再进入纸面观察。</p></div><div class="answer">回答：如果判断错误，何时退出，最多损失多少？</div></article>
+        </div>
+      </section>
+
+      <section id="lab">
+        <div class="section-heading">
+          <div><span class="eyebrow">Interactive rehearsal</span><h2>交易决策演练器</h2></div>
+          <p>选择你的假设，指南会给出值得在工作台研究的结构和验证路径。输出不是个性化投资建议。</p>
+        </div>
+        <div class="lab">
+          <div class="lab-controls">
+            <h3>输入交易假设</h3>
+            <div class="control-grid">
+              <label>价格预期
+                <select id="price-view">
+                  <option value="bullish">上涨</option>
+                  <option value="bearish">下跌</option>
+                  <option value="range">区间震荡</option>
+                  <option value="uncertain">方向不确定</option>
+                </select>
+              </label>
+              <label>当前 IV 水平
+                <select id="iv-level">
+                  <option value="low">偏低</option>
+                  <option value="normal" selected>中性</option>
+                  <option value="high">偏高</option>
+                </select>
+              </label>
+              <label>未来实际波动相对 Expected Move
+                <select id="move-view">
+                  <option value="larger">可能更大</option>
+                  <option value="similar" selected>大致相当</option>
+                  <option value="smaller">可能更小</option>
+                </select>
+              </label>
+              <label>持有期限
+                <select id="horizon">
+                  <option value="0d">0DTE 日内</option>
+                  <option value="short" selected>1–7 天</option>
+                  <option value="medium">8–45 天</option>
+                </select>
+              </label>
+              <label>账户资金 USD
+                <input id="account" type="number" min="100" step="100" value="10000">
+              </label>
+              <label>单笔风险预算 %
+                <input id="risk-pct" type="number" min="0.1" max="10" step="0.1" value="1">
+              </label>
+              <label>风险预览中的 Max Loss USD
+                <input id="max-loss" type="number" min="1" step="1" value="200">
+              </label>
+              <label>经验级别
+                <select id="experience">
+                  <option value="beginner" selected>初学者：仅定义风险</option>
+                  <option value="paper">纸面进阶</option>
+                </select>
+              </label>
+            </div>
+            <div class="risk-line">
+              <div class="risk-value"><span>风险预算</span><strong id="risk-budget">$100</strong></div>
+              <div class="risk-value"><span>理论数量上限</span><strong id="max-quantity">0</strong></div>
+              <div class="risk-value"><span>预算判断</span><strong id="budget-state" class="warn">超预算</strong></div>
+            </div>
+            <p class="lab-disclaimer">数量上限只做算术演练，未计入相关性、滑点、组合保证金、指派风险和已有仓位。真实决策应采用更低数量。</p>
+          </div>
+          <div class="lab-output" aria-live="polite">
+            <h3>研究输出</h3>
+            <div class="output-head"><span>候选表达方式</span><strong id="thesis-title">看涨 · IV 中性</strong></div>
+            <div class="output-block"><b>优先研究的结构</b><div class="structure-list" id="structures"></div></div>
+            <div class="output-block"><b>必须验证的面板</b><p id="checks"></p></div>
+            <div class="output-block"><b>这个系统怎样帮助你</b><p id="support"></p></div>
+            <div class="output-block"><b>否决条件</b><p id="rejects"></p></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="metrics">
+        <div class="section-heading">
+          <div><span class="eyebrow">Metric dictionary</span><h2>核心指标怎样读</h2></div>
+          <p>指标首先描述市场状态，其次才可能服务于交易假设。没有任何一个指标可以单独决定方向。</p>
+        </div>
+        <table class="metric-table">
+          <thead><tr><th>指标</th><th>它回答什么</th><th>常见误用</th></tr></thead>
+          <tbody>
+            <tr><td>ATM IV</td><td>平值期权隐含的年化波动水平。</td><td>把高 IV 当成必跌，或把低 IV 当成必涨。</td></tr>
+            <tr><td>IV Rank</td><td>当前 IV 位于历史最低与最高之间的位置。</td><td>忽略极端值对最高/最低区间的扭曲。</td></tr>
+            <tr><td>IV Percentile</td><td>历史样本中有多少比例低于当前 IV。</td><td>把百分位直接当成卖波动信号。</td></tr>
+            <tr><td>RV20 / VRP20</td><td>近期实际波动，以及 IV 相对 RV 的溢价。</td><td>认为正 VRP 能保证卖方获利，忽略跳空和尾部风险。</td></tr>
+            <tr><td>Expected Move</td><td>按当前 IV 和剩余时间估算的波动尺度。</td><td>把它当成不可突破的支撑和阻力。</td></tr>
+            <tr><td>25Δ RR</td><td>Call 翼与 Put 翼的相对 IV；负值通常表示 Put 翼更贵。</td><td>把保护需求直接解释成未来必跌。</td></tr>
+            <tr><td>25Δ BF</td><td>两侧翼部相对 ATM 的昂贵程度。</td><td>忽略翼部报价稀疏导致的假笑脸。</td></tr>
+            <tr><td>Net GEX</td><td>在选定 Dealer 假设下的模型化 Gamma 暴露。</td><td>用正负号预测方向；它更多描述潜在的对冲稳定/放大机制。</td></tr>
+            <tr><td>Gamma Flip</td><td>模型净 GEX 改变符号的场景价格。</td><td>把模型交点当作必然反转价。</td></tr>
+            <tr><td>PCR</td><td>Put OI 与 Call OI 的比值。</td><td>忽略备兑、保护和多腿组合，直接判定多空。</td></tr>
+            <tr><td>SVI 残差</td><td>观测 IV 相对平滑拟合曲线的偏离。</td><td>不检查 NBBO 和质量，就把大残差视为套利。</td></tr>
+            <tr><td>C / M</td><td>曲面的价格凸性和单调性违规数量。</td><td>在 Research 低置信度状态下使用曲面定价交易。</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="strategy">
+        <div class="section-heading">
+          <div><span class="eyebrow">Structure and risk</span><h2>把判断翻译成策略结构</h2></div>
+          <p>下面只是“假设与结构”的教育映射。最终是否值得交易取决于价格、流动性、风险预算和退出规则。</p>
+        </div>
+        <table class="strategy-table">
+          <thead><tr><th>研究假设</th><th>可研究结构</th><th>工作台重点</th><th>主要风险</th></tr></thead>
+          <tbody>
+            <tr><td>温和看涨</td><td>Long Call、Bull Call Spread</td><td>Call IV、RR、盈亏平衡、Theta、Ask 与价差。</td><td>方向正确但幅度不足，或时间价值损耗。</td></tr>
+            <tr><td>温和看跌</td><td>Long Put、Bear Put Spread</td><td>Put 翼偏斜、Expected Move、盈亏平衡与权利金。</td><td>Put 保护过贵，跌幅不足以覆盖波动率回落。</td></tr>
+            <tr><td>预期大幅运动</td><td>Long Straddle、Long Strangle</td><td>组合成本、Expected Move、VRP、双侧流动性。</td><td>实际运动小于隐含运动，Theta 双倍消耗。</td></tr>
+            <tr><td>预期区间震荡且 IV 偏高</td><td>Defined-risk Iron Condor、Credit Spread</td><td>Max Loss、尾部情景、Gamma、滑点和指派风险。</td><td>负 Gamma，单次跳空可能吞噬多次小盈利。</td></tr>
+            <tr><td>看期限错位</td><td>Calendar、Diagonal</td><td>期限结构、各期限 SVI、Vega/Theta 与双期限报价。</td><td>不同期限对 IV 与价格移动的反应不一致。</td></tr>
+          </tbody>
+        </table>
+        <p class="section-copy" style="margin-top: 14px;">策略风险引擎中的 Entry Cash 为建仓现金流，Max Loss 才是风险预算核心。POP 是模型概率，不是胜率承诺；多腿纸面订单按顺序提交，不是交易所原子组合，仍可能出现部分成交。</p>
+      </section>
+
+      <section id="example">
+        <div class="section-heading">
+          <div><span class="eyebrow">Worked example</span><h2>怎样阅读当前截图</h2></div>
+          <p>示例展示的是分析方法，而不是对 SPY 的实时建议。</p>
+        </div>
+        <div class="example">
+          <div class="example-summary"><span>SPY · 0D 截面</span><strong>Spot 739.62</strong><span>Expected Move 4.69</span></div>
+          <div class="example-reading">
+            <div><b class="good">数据可以使用</b><p>Streaming、Fresh 约 90%、OI 约 96%、延迟 381ms、质量 ready，满足当前截面分析条件。</p></div>
+            <div><b class="info">隐含高于实际</b><p>ATM IV 25.0%、RV20 10.6%、VRP 14.38。说明期权包含明显波动溢价，但不自动等于卖出机会。</p></div>
+            <div><b class="warn">下行偏斜明显</b><p>RR 为 -2.78，Put 翼比 Call 翼更贵。先判断这是合理保护需求，还是报价/事件造成的异常。</p></div>
+            <div><b class="warn">GEX 不给方向</b><p>Net GEX 为负只表示模型下对冲流可能更具放大性，不能据此单独看空。</p></div>
+            <div><b class="bad">曲面置信度有限</b><p>Research 30、C18、M1，说明跨期限曲面调整较多。此时优先使用单期限微笑，不做曲面套利断言。</p></div>
+            <div><b class="bad">当前组合应否决</b><p>策略腿出现 invalid NBBO 和 low quote quality。即使盈亏图漂亮，也不具备可执行性。</p></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="workflow">
+        <div class="section-heading">
+          <div><span class="eyebrow">Daily operating procedure</span><h2>历史与实时的标准流程</h2></div>
+          <p>把历史研究和实时观察分开，避免用看过结果的数据证明当天想做的交易。</p>
+        </div>
+        <div class="workflow-columns">
+          <article class="workflow">
+            <h3>历史回放：学习和验证</h3>
+            <ol>
+              <li>选择一个标的、一个日期和一个到期日，从开盘开始。</li>
+              <li>在 10:00、12:00、15:00 暂停，记录价格、ATM IV、RR、VRP 和数据质量。</li>
+              <li>先写交易假设，再添加合约腿；不要看完全天走势后倒推入场理由。</li>
+              <li>使用同一价格模式、数量和退出规则比较多个日期。</li>
+              <li>用书签保存关键快照，复盘错在方向、波动、结构、成交还是风险管理。</li>
+            </ol>
+          </article>
+          <article class="workflow live">
+            <h3>实时工作台：观察和纸面决策</h3>
+            <ol>
+              <li>确认 Streaming、Fresh、OI、延迟和 quality 状态。</li>
+              <li>记录现货路径和 Expected Move，写下失效价格与最晚持有时间。</li>
+              <li>比较 IV/RV、偏斜、期限和暴露，只保留与假设一致的证据。</li>
+              <li>从镜像链选择有效 NBBO 合约，进行风险预览和情景压力测试。</li>
+              <li>保存审计快照；初学阶段停在这里，不解除纸面执行锁。</li>
+            </ol>
+          </article>
+        </div>
+      </section>
+
+      <section id="stop">
+        <div class="section-heading">
+          <div><span class="eyebrow">No-trade checklist</span><h2>出现这些情况，停止</h2></div>
+          <p>一个专业决策流程首先定义“不交易”。这些条件比任何单一机会都重要。</p>
+        </div>
+        <div class="red-flags">
+          <div class="flag"><b>数据流不健康</b><span>非 Streaming、延迟超过5秒、Fresh低于80%，或标的与页面截面不一致。</span></div>
+          <div class="flag"><b>指标被数据阻断</b><span>OI不足却使用GEX/PCR，SVI未就绪却解释残差，Research曲面却宣称套利。</span></div>
+          <div class="flag"><b>合约不可执行</b><span>无双边NBBO、0/0.01报价、价差过宽、质量过低，或策略使用错误到期日。</span></div>
+          <div class="flag"><b>风险无法陈述</b><span>不知道Max Loss、盈亏平衡、最坏情景、退出条件或指派后果。</span></div>
+          <div class="flag"><b>结构与假设不一致</b><span>看对方向仍可能亏损，说明购买了过贵IV、选择了错误期限或幅度要求过高。</span></div>
+          <div class="flag"><b>为了交易而交易</b><span>先选择策略，再从GEX、PCR、Skew中挑选支持理由；这属于结果导向解释。</span></div>
+        </div>
+      </section>
+
+      <section id="glossary">
+        <div class="section-heading">
+          <div><span class="eyebrow">Glossary</span><h2>初学者术语表</h2></div>
+          <p>多数标准美股期权以100股为合约乘数；公司行动调整后的合约可能例外。</p>
+        </div>
+        <dl class="glossary">
+          <div class="term"><dt>Call / Put</dt><dd>分别是看涨和看跌期权。买方拥有权利，卖方承担履约义务。</dd></div>
+          <div class="term"><dt>Long / Short</dt><dd>Long 是买入权利，Short 是卖出义务。Short 的风险并不等于收到的权利金。</dd></div>
+          <div class="term"><dt>DTE</dt><dd>距离到期的日历天数。0DTE 对现货变化和时间流逝极为敏感。</dd></div>
+          <div class="term"><dt>NBBO</dt><dd>全市场最佳买价与卖价。策略成本应基于可执行买卖侧，而不是只看Mid。</dd></div>
+          <div class="term"><dt>Delta</dt><dd>期权价格对标的价格小幅变化的一阶敏感度，也常用于定义翼部位置。</dd></div>
+          <div class="term"><dt>Gamma</dt><dd>Delta 对标的价格变化的敏感度。临近到期的平值期权 Gamma 常显著升高。</dd></div>
+          <div class="term"><dt>Theta</dt><dd>其他条件不变时，时间流逝对期权理论价值的影响。</dd></div>
+          <div class="term"><dt>Vega</dt><dd>隐含波动率变化对期权价格的敏感度。</dd></div>
+          <div class="term"><dt>IV</dt><dd>从市场期权价格反推出的年化波动预期，不包含确定方向。</dd></div>
+          <div class="term"><dt>Skew / Smile</dt><dd>不同执行价的IV不相同，形成偏斜或微笑，反映供需、尾部风险和结构性定价。</dd></div>
+          <div class="term"><dt>SVI</dt><dd>对总方差微笑进行参数化拟合的模型，用于平滑比较，不保证真实市场无套利。</dd></div>
+          <div class="term"><dt>Open Interest</dt><dd>未平仓合约数量。它不是当天成交量，也不能识别持仓者方向。</dd></div>
+        </dl>
+      </section>
+
+      <section>
+        <div class="section-heading">
+          <div><span class="eyebrow">Primary sources</span><h2>继续学习</h2></div>
+          <p>指南用于解释本地工作台。正式参与期权市场前，应学习交易所与清算机构的原始教育材料。</p>
+        </div>
+        <div class="source-links">
+          <a href="https://www.theocc.com/company-information/documents-and-archives/options-disclosure-document" target="_blank" rel="noreferrer">OCC 标准化期权风险披露</a>
+          <a href="https://www.cboe.com/optionsinstitute/defining-options" target="_blank" rel="noreferrer">Cboe Options Institute 基础</a>
+          <a href="https://www.optionseducation.org/advancedconcepts/volatility-the-greeks" target="_blank" rel="noreferrer">OIC 波动率与 Greeks</a>
+          <a href="/?mode=replay">打开历史回放</a>
+          <a href="/?mode=live">打开实时工作台</a>
+        </div>
+      </section>
+
+      <footer>
+        本指南中的结构匹配、概率和风险预算均为教育演练，不构成投资建议。工作台中的 Dealer Exposure 是模型假设，不是已知做市商仓位；曲面处于 Research 状态时不得用于无套利或可成交性断言。
+      </footer>
+    </main>
+  </div>
+
+  <script>
+    const $ = (selector) => document.querySelector(selector)
+    const controls = ['#price-view', '#iv-level', '#move-view', '#horizon', '#account', '#risk-pct', '#max-loss', '#experience']
+
+    const labels = {
+      bullish: '看涨',
+      bearish: '看跌',
+      range: '区间震荡',
+      uncertain: '方向不确定',
+      low: 'IV 偏低',
+      normal: 'IV 中性',
+      high: 'IV 偏高',
+    }
+
+    function researchPlan(price, iv, move, experience) {
+      const definedOnly = experience === 'beginner'
+      let structures = []
+      let checks = '先通过数据门禁，再检查 Expected Move、ATM IV/RV、期限结构与每条腿的 NBBO。'
+      let support = '工作台把假设映射到同一时刻的波动率、偏斜和组合风险，帮助你发现“方向可能正确但结构仍会亏损”的情况。'
+      let rejects = 'Fresh Quote < 80%、延迟 > 5 秒、无有效双边 NBBO、价差过宽、Max Loss 超预算或退出条件不明确。'
+
+      if (price === 'bullish') {
+        structures = iv === 'high' ? ['Bull Call Spread'] : ['Long Call', 'Bull Call Spread']
+        if (!definedOnly && iv === 'high') structures.push('Put Credit Spread')
+        checks = '现货趋势与失效价；Call IV；25Δ RR；盈亏平衡；Theta；长短腿价差与到期日。'
+        support = '用微笑判断 Call 是否过贵，用风险引擎比较单腿与垂直价差在相同上涨路径下的成本和上限。'
+      } else if (price === 'bearish') {
+        structures = iv === 'high' ? ['Bear Put Spread'] : ['Long Put', 'Bear Put Spread']
+        if (!definedOnly && iv === 'high') structures.push('Call Credit Spread')
+        checks = '现货失效价；Put 翼偏斜；Expected Move；盈亏平衡；Vega；双腿可执行价。'
+        support = '用 RR 和 SVI 残差识别下跌保护是否已经过贵，再比较单腿 Put 与价差的波动率回落风险。'
+      } else if (price === 'range') {
+        if (iv === 'high' && move === 'smaller') {
+          structures = ['Defined-risk Iron Condor', 'Credit Spread']
+        } else {
+          structures = ['Wait / Observe', 'Defined-risk Butterfly']
+        }
+        checks = 'Expected Move 边界；实际振幅；Net GEX 情景；翼部流动性；Max Loss 与尾部跳空压力。'
+        support = '用 Expected Move 和情景矩阵检查区间是否足够宽，并把负 Gamma 和尾部损失显式展示出来。'
+        rejects += ' 0DTE 负 Gamma 结构在重大事件、跳空或流动性下降时应直接否决。'
+      } else {
+        if (move === 'larger' && iv !== 'high') {
+          structures = ['Long Straddle', 'Long Strangle']
+        } else if (move === 'smaller' && iv === 'high') {
+          structures = ['Defined-risk Iron Condor']
+        } else {
+          structures = ['Wait / Observe']
+        }
+        checks = 'Expected Move；VRP；双侧微笑；期限结构；跨式总成本；两侧 NBBO 和 Theta。'
+        support = '工作台不会替你猜方向，而是比较“买下这段隐含运动要付多少钱”以及实际运动必须多大才能覆盖成本。'
+      }
+      return { structures, checks, support, rejects }
+    }
+
+    function renderLab() {
+      const price = $('#price-view').value
+      const iv = $('#iv-level').value
+      const move = $('#move-view').value
+      const horizon = $('#horizon').value
+      const experience = $('#experience').value
+      const account = Math.max(0, Number($('#account').value) || 0)
+      const riskPct = Math.max(0, Number($('#risk-pct').value) || 0)
+      const maxLoss = Math.max(0, Number($('#max-loss').value) || 0)
+      const budget = account * riskPct / 100
+      const quantity = maxLoss > 0 ? Math.floor(budget / maxLoss) : 0
+      const withinBudget = maxLoss > 0 && maxLoss <= budget
+      const plan = researchPlan(price, iv, move, experience)
+
+      $('#thesis-title').textContent = `${labels[price]} · ${labels[iv]}`
+      $('#structures').innerHTML = plan.structures.map((item) => `<span>${item}</span>`).join('')
+      $('#checks').textContent = plan.checks
+      $('#support').textContent = plan.support
+      $('#rejects').textContent = `${plan.rejects}${horizon === '0d' ? ' 当前选择0DTE：Gamma、Theta和滑点风险显著提高，初学者应只做回放与纸面观察。' : ''}`
+      $('#risk-budget').textContent = `$${budget.toFixed(0)}`
+      $('#max-quantity').textContent = String(quantity)
+      $('#budget-state').textContent = withinBudget ? '预算内' : '超预算'
+      $('#budget-state').className = withinBudget ? 'good' : 'warn'
+    }
+
+    controls.forEach((selector) => $(selector).addEventListener('input', renderLab))
+    renderLab()
+
+    const tocLinks = [...document.querySelectorAll('.toc a')]
+    const sections = tocLinks.map((link) => document.querySelector(link.getAttribute('href'))).filter(Boolean)
+    const observer = new IntersectionObserver((entries) => {
+      entries.forEach((entry) => {
+        if (!entry.isIntersecting) return
+        tocLinks.forEach((link) => link.classList.toggle('active', link.getAttribute('href') === `#${entry.target.id}`))
+      })
+    }, { rootMargin: '-20% 0px -72% 0px' })
+    sections.forEach((section) => observer.observe(section))
+
+    window.addEventListener('scroll', () => {
+      const max = document.documentElement.scrollHeight - window.innerHeight
+      $('#progress').style.width = `${max > 0 ? (window.scrollY / max) * 100 : 0}%`
+    }, { passive: true })
+  </script>
+</body>
+</html>

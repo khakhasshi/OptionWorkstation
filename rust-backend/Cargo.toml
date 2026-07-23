@@ -1,0 +1,39 @@
+[package]
+name = "option-workstation"
+version = "0.1.0"
+edition = "2024"
+description = "Rust analytics and local API server for Option Workstation"
+license = "Apache-2.0"
+readme = "../README.md"
+publish = false
+
+[dependencies]
+anyhow = "1.0"
+arrow-array = "59.1"
+axum = { version = "0.8.9", features = ["ws"] }
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+dashmap = "6.1"
+futures-util = "0.3"
+hex = "0.4"
+longbridge = "4.4.1"
+moka = { version = "0.12", features = ["sync"] }
+parquet = { version = "59.1", default-features = false, features = ["arrow", "snap", "zstd"] }
+rust_decimal = "1.39"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+statrs = "0.18"
+thiserror = "2.0"
+time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
+tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+approx = "0.5"
+
+[patch.crates-io]
+longbridge-oauth = { path = "../vendor/longbridge-oauth" }

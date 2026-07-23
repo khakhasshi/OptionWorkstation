@@ -1,0 +1,52 @@
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Proprietary or local market data
+data/
+*.parquet
+*.arrow
+*.feather
+
+# Runtime state
+.option-workstation/
+audit.jsonl
+*.jsonl
+artifacts/
+logs/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+**/.npm-cache/
+
+# Rust
+**/target/
+
+# Python reference implementation
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+**/__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Coverage and temporary files
+coverage/
+*.lcov
+*.tmp
+*.log

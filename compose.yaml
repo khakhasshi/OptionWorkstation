@@ -1,0 +1,17 @@
+services:
+  workstation:
+    build:
+      context: .
+    image: option-workstation:local
+    ports:
+      - "127.0.0.1:${OPTION_WORKSTATION_PORT:-7311}:7311"
+    environment:
+      OPTION_WORKSTATION_RISK_FREE_RATE: "${OPTION_WORKSTATION_RISK_FREE_RATE:-0.043}"
+      OPTION_WORKSTATION_PAPER_ORDER_EXECUTION: "${OPTION_WORKSTATION_PAPER_ORDER_EXECUTION:-0}"
+    volumes:
+      - "${OPTION_WORKSTATION_DATA_ROOT:-./data}:/data:ro"
+      - option-workstation-state:/state
+    restart: unless-stopped
+
+volumes:
+  option-workstation-state:

@@ -1,0 +1,17 @@
+.git
+.github
+.env
+.env.*
+!.env.example
+.DS_Store
+.pytest_cache
+.venv
+artifacts
+data
+logs
+frontend/node_modules
+frontend/dist
+**/target
+**/__pycache__
+*.parquet
+*.jsonl

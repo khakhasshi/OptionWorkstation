@@ -1,0 +1,9 @@
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.parquet binary
+Cargo.lock text eol=lf
+package-lock.json text eol=lf

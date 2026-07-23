@@ -1,0 +1,50 @@
+name: Container
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile"
+      - "compose.yaml"
+      - "frontend/**"
+      - "rust-backend/**"
+      - "vendor/**"
+  pull_request:
+    paths:
+      - "Dockerfile"
+      - "compose.yaml"
+      - "frontend/**"
+      - "rust-backend/**"
+      - "vendor/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Without Publishing
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          tags: option-workstation:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - run: docker run --detach --rm --name option-workstation-ci --publish 127.0.0.1:7311:7311 option-workstation:ci
+      - run: |
+          for attempt in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:7311/api/health >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs option-workstation-ci
+          exit 1
+      - if: always()
+        run: docker stop option-workstation-ci || true
