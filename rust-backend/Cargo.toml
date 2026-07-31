@@ -37,3 +37,5 @@ approx = "0.5"
 
 [patch.crates-io]
 longbridge-oauth = { path = "../vendor/longbridge-oauth" }
+dotenv = { path = "../vendor/dotenv" }
+paste = { path = "../vendor/paste" }
