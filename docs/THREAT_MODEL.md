@@ -44,6 +44,9 @@ supply chain are separate trust boundaries.
 
 - loopback-only default binding;
 - same-origin credential flow and process-memory SDK contexts;
+- Longbridge OAuth authorization-code flow with a process-memory token store;
+- OAuth status responses expose only flow metadata and an authorization URL,
+  never an access or refresh token;
 - credential-field rejection in audit payloads;
 - explicit request bounds and typed request models;
 - paper-account recognition, server enablement, freshness, and typed
@@ -64,7 +67,8 @@ The project does not currently secure:
 - hostile provider or exchange infrastructure;
 - real-money automated trading.
 
-Such deployments need authentication, TLS, CSRF/origin controls, authorization,
+Longbridge OAuth is provider authorization only; it does not authenticate users
+to this HTTP service. Such deployments need application authentication, TLS, CSRF/origin controls, authorization,
 rate limiting, external secret storage, hardened logging, and independent
 security review.
 

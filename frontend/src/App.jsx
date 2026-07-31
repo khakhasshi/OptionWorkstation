@@ -99,9 +99,11 @@ function App() {
   const [workspaceId, setWorkspaceId] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
-  const [connection, setConnection] = useState({ connected: false, state: 'disconnected', packages: [], subscribed_contracts: 0 })
+  const [connection, setConnection] = useState({ connected: false, state: 'disconnected', auth_method: 'none', packages: [], subscribed_contracts: 0 })
   const [credentialOpen, setCredentialOpen] = useState(false)
   const [credentials, setCredentials] = useState({ app_key: '', app_secret: '', access_token: '' })
+  const [oauthClientId, setOauthClientId] = useState('')
+  const [oauthStatus, setOauthStatus] = useState({ status: 'idle', flow_id: null, client_id: null, authorization_url: null, error: null })
   const [liveSymbolDraft, setLiveSymbolDraft] = useState('SPY')
   const [liveFeed, setLiveFeed] = useState(null)
   const [liveSocketState, setLiveSocketState] = useState('idle')
@@ -146,13 +148,40 @@ function App() {
   }, [connection.connected, connection.trade_connected])
 
   useEffect(() => {
-    Promise.all([api('/api/catalog'), api('/api/connection')]).then(([data, status]) => {
+    Promise.all([api('/api/catalog'), api('/api/connection'), api('/api/oauth/status')]).then(([data, status, oauth]) => {
       setCatalog(data)
       setConnection(status)
+      setOauthStatus(oauth)
       setTradingDate(data.common_dates.at(-1) || '')
     }).catch((reason) => setError(reason.message))
     refreshAudit().catch((reason) => setError(reason.message))
   }, [refreshAudit])
+
+  useEffect(() => {
+    if (!['pending', 'connecting'].includes(oauthStatus.status)) return undefined
+    let active = true
+    const poll = async () => {
+      try {
+        const status = await api('/api/oauth/status')
+        if (!active) return
+        setOauthStatus(status)
+        if (status.status === 'connected') {
+          setConnection(await api('/api/connection'))
+        }
+      } catch (reason) {
+        if (active) setError(reason.message)
+      }
+    }
+    const timer = window.setInterval(poll, 1000)
+    return () => {
+      active = false
+      window.clearInterval(timer)
+    }
+  }, [oauthStatus.status])
+
+  useEffect(() => {
+    if (oauthStatus.status === 'error' && oauthStatus.error) setError(oauthStatus.error)
+  }, [oauthStatus.status, oauthStatus.error])
 
   useEffect(() => {
     localStorage.setItem('option-workstation-layout', layout)
@@ -261,6 +290,20 @@ function App() {
     }
   }
 
+  const startOAuth = async (event) => {
+    event.preventDefault()
+    setLoading(true)
+    setError('')
+    try {
+      const status = await apiJson('/api/oauth/start', 'POST', { client_id: oauthClientId.trim() })
+      setOauthStatus(status)
+    } catch (reason) {
+      setError(reason.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
   const disconnectLongbridge = async () => {
     try {
       const pending = liveRequestRef.current
@@ -271,6 +314,7 @@ function App() {
       setLiveSwitch(null)
       const status = await apiJson('/api/connection', 'DELETE')
       setConnection(status)
+      setOauthStatus(await api('/api/oauth/status'))
       liveSequenceRef.current = -1
       setLiveFeed(null)
       setLiveSocketState('idle')
@@ -980,9 +1024,21 @@ function App() {
           <div className="credential-header"><div><KeyRound size={18} /><div><strong id="credential-title">Longbridge OpenAPI</strong><span>实时行情连接</span></div></div><button className="drawer-close" title="关闭" onClick={() => setCredentialOpen(false)}><X size={17} /></button></div>
           <div className={`connection-summary ${connection.connected ? 'connected' : ''}`}>
             {connection.connected ? <Wifi size={17} /> : <WifiOff size={17} />}
-            <div><strong>{connection.connected ? `已连接 ${connection.account_hint || ''}` : '尚未连接'}</strong><span>{quotePermission} · {connection.state}</span></div>
+            <div><strong>{connection.connected ? `已连接 ${connection.account_hint || ''}` : '尚未连接'}</strong><span>{quotePermission} · {connection.state} · {connection.auth_method === 'oauth' ? 'OAuth 2.0' : connection.auth_method === 'apikey' ? 'API Key' : '未认证'}</span></div>
           </div>
           {connection.connected && <div className="trade-connection-grid"><div><span>Trade API</span><b>{connection.trade_connected ? 'Connected' : 'Unavailable'}</b></div><div><span>Account</span><b>{connection.account_type || '--'}</b></div><div><span>Buying Power</span><b>{connection.buy_power || '--'}</b></div><div><span>Paper Orders</span><b className={connection.order_execution_enabled ? 'ok-text' : 'warning-text'}>{connection.order_execution_enabled ? 'Enabled' : 'Locked'}</b></div></div>}
+          <section className="oauth-section" aria-labelledby="oauth-title">
+            <div className="oauth-heading"><div><Radio size={15} /><strong id="oauth-title">Longbridge OAuth 2.0</strong></div><span>推荐</span></div>
+            <p>使用浏览器完成授权，不需要在工作台输入 App Secret。Access Token 只驻留 Rust 进程内存，不写入浏览器存储或本地文件。</p>
+            <form className="oauth-form" onSubmit={startOAuth} autoComplete="off">
+              <label htmlFor="lb-oauth-client-id"><span>OAuth Client ID / App Key</span><input id="lb-oauth-client-id" type="text" autoComplete="off" placeholder="输入 Longbridge OAuth Client ID" value={oauthClientId} onChange={(event) => setOauthClientId(event.target.value)} /></label>
+              <button className="oauth-button" type="submit" disabled={loading || ['pending', 'connecting'].includes(oauthStatus.status)}><Radio size={14} />{oauthStatus.status === 'connecting' ? '正在建立连接' : oauthStatus.status === 'pending' ? '等待浏览器授权' : '开始 OAuth 授权'}</button>
+            </form>
+            {oauthStatus.authorization_url && <div className="oauth-status"><span>授权页面已准备好</span><a className="oauth-link" href={oauthStatus.authorization_url} target="_blank" rel="noreferrer">打开授权页面</a></div>}
+            {oauthStatus.status === 'pending' && <div className="oauth-status muted">完成授权后此窗口会自动验证连接；不要关闭本地服务。</div>}
+            {oauthStatus.status === 'connected' && <div className="oauth-status success">OAuth 已连接，可开始实时会话。</div>}
+            {oauthStatus.status === 'error' && oauthStatus.error && <div className="oauth-status failure">{oauthStatus.error}</div>}
+          </section>
           <form className="credential-form" onSubmit={submitCredentials} autoComplete="off">
             <label htmlFor="lb-app-key"><span>App Key</span><input id="lb-app-key" type="password" autoComplete="new-password" value={credentials.app_key} onChange={(event) => setCredentials((current) => ({ ...current, app_key: event.target.value }))} /></label>
             <label htmlFor="lb-app-secret"><span>App Secret</span><input id="lb-app-secret" type="password" autoComplete="new-password" value={credentials.app_secret} onChange={(event) => setCredentials((current) => ({ ...current, app_secret: event.target.value }))} /></label>

@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     env,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -15,6 +15,7 @@ use chrono_tz::America::New_York;
 use dashmap::DashMap;
 use longbridge::{
     Config,
+    oauth::{OAuth, OAuthBuilder, OAuthError, OAuthResult, StoredToken, TokenStorage},
     quote::{
         AdjustType, Candlestick, Period, PushEvent, PushEventDetail, QuoteContext, StrikePriceInfo,
         SubFlags, TradeSessions,
@@ -26,13 +27,16 @@ use longbridge::{
 };
 use rust_decimal::prelude::ToPrimitive;
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio::{
+    sync::{Mutex, RwLock, broadcast},
+    task::JoinHandle,
+};
 
 use crate::{
     analytics::{ChainBuild, build_chain, build_surface},
     models::{
         Bar, ConnectionStatus, CredentialRequest, LiveFeedInfo, LiveSessionRequest, LiveSnapshot,
-        RawOptionQuote,
+        OAuthStatus, RawOptionQuote,
     },
     strategy::ExecutionLeg,
 };
@@ -42,6 +46,28 @@ const OPENAPI_SUBSCRIPTION_LIMIT: usize = 500;
 const RESERVED_SUBSCRIPTIONS: usize = 20;
 const OPTION_REQUEST_COOLDOWN: Duration = Duration::from_secs(65);
 const OPTION_RETRY_MARKER: &str = "option_retry_after_ms=";
+const OAUTH_CALLBACK_PORT: u16 = 60355;
+const OAUTH_URL_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Default)]
+struct MemoryTokenStorage {
+    token: Arc<StdMutex<Option<StoredToken>>>,
+}
+
+impl TokenStorage for MemoryTokenStorage {
+    fn load(&self, _client_id: &str) -> Option<StoredToken> {
+        self.token.lock().ok()?.clone()
+    }
+
+    fn save(&self, token: &StoredToken) -> OAuthResult<()> {
+        let mut stored = self
+            .token
+            .lock()
+            .map_err(|_| OAuthError::Other("OAuth token storage lock poisoned".into()))?;
+        *stored = Some(token.clone());
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone)]
 struct TopOfBook {
@@ -123,6 +149,12 @@ struct ManagerState {
     status: ConnectionStatus,
 }
 
+#[derive(Default)]
+struct OAuthFlowState {
+    status: OAuthStatus,
+    task: Option<JoinHandle<()>>,
+}
+
 pub struct LiveManager {
     state: RwLock<ManagerState>,
     session_setup: Mutex<()>,
@@ -131,6 +163,8 @@ pub struct LiveManager {
     events: broadcast::Sender<u64>,
     sequence: AtomicU64,
     refresh_started: AtomicBool,
+    oauth_sequence: AtomicU64,
+    oauth_flow: Mutex<OAuthFlowState>,
     snapshot_cache: Mutex<Option<(u64, LiveSnapshot)>>,
     risk_free_rate: f64,
     paper_execution_requested: bool,
@@ -147,6 +181,8 @@ impl LiveManager {
             events,
             sequence: AtomicU64::new(0),
             refresh_started: AtomicBool::new(false),
+            oauth_sequence: AtomicU64::new(0),
+            oauth_flow: Mutex::new(OAuthFlowState::default()),
             snapshot_cache: Mutex::new(None),
             risk_free_rate,
             paper_execution_requested: env::var("OPTION_WORKSTATION_PAPER_ORDER_EXECUTION")
@@ -196,6 +232,10 @@ impl LiveManager {
 
     pub async fn status(&self) -> ConnectionStatus {
         self.state.read().await.status.clone()
+    }
+
+    pub async fn oauth_status(&self) -> OAuthStatus {
+        self.oauth_flow.lock().await.status.clone()
     }
 
     pub async fn daily_closes(&self, count: usize) -> anyhow::Result<Vec<(String, f64)>> {
@@ -465,23 +505,135 @@ impl LiveManager {
         });
     }
 
-    pub async fn connect(
+    async fn cancel_oauth_flow(&self) {
+        let mut flow = self.oauth_flow.lock().await;
+        if let Some(task) = flow.task.take() {
+            task.abort();
+        }
+        flow.status = OAuthStatus::default();
+    }
+
+    async fn finish_oauth(self: Arc<Self>, flow_id: String, result: OAuthResult<OAuth>) {
+        {
+            let mut flow = self.oauth_flow.lock().await;
+            if flow.status.flow_id.as_deref() != Some(flow_id.as_str()) {
+                return;
+            }
+            flow.status.status = "connecting".into();
+            flow.status.authorization_url = None;
+            flow.status.error = None;
+        }
+
+        let outcome = match result {
+            Ok(oauth) => self.connect_oauth(oauth).await,
+            Err(error) => Err(anyhow!("Longbridge OAuth 授权失败: {error}")),
+        };
+
+        let mut flow = self.oauth_flow.lock().await;
+        if flow.status.flow_id.as_deref() != Some(flow_id.as_str()) {
+            return;
+        }
+        match outcome {
+            Ok(_) => {
+                flow.status.status = "connected".into();
+                flow.status.error = None;
+            }
+            Err(error) => {
+                flow.status.status = "error".into();
+                flow.status.error = Some(format!("{error:#}"));
+            }
+        }
+    }
+
+    pub async fn start_oauth(self: &Arc<Self>, client_id: String) -> anyhow::Result<OAuthStatus> {
+        let client_id = client_id.trim().to_string();
+        anyhow::ensure!(!client_id.is_empty(), "OAuth Client ID 不能为空");
+        anyhow::ensure!(
+            client_id.len() <= 256
+                && client_id.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | ':')
+                }),
+            "OAuth Client ID 格式异常"
+        );
+
+        let mut flow = self.oauth_flow.lock().await;
+        if matches!(flow.status.status.as_str(), "pending" | "connecting") {
+            return Ok(flow.status.clone());
+        }
+        if let Some(task) = flow.task.take() {
+            task.abort();
+        }
+
+        let flow_id = format!(
+            "oauth-{}",
+            self.oauth_sequence.fetch_add(1, Ordering::Relaxed) + 1
+        );
+        let (url_sender, url_receiver) = tokio::sync::oneshot::channel::<String>();
+        let url_sender = Arc::new(StdMutex::new(Some(url_sender)));
+        let manager = Arc::clone(self);
+        let task_flow_id = flow_id.clone();
+        let task_client_id = client_id.clone();
+        let task_url_sender = Arc::clone(&url_sender);
+        let task = tokio::spawn(async move {
+            let storage = MemoryTokenStorage::default();
+            let result = OAuthBuilder::new(task_client_id)
+                .callback_port(OAUTH_CALLBACK_PORT)
+                .token_storage(storage)
+                .build(move |url| {
+                    if let Ok(mut sender) = task_url_sender.lock()
+                        && let Some(sender) = sender.take()
+                    {
+                        let _ = sender.send(url.to_string());
+                    }
+                })
+                .await;
+            manager.finish_oauth(task_flow_id, result).await;
+        });
+        flow.status = OAuthStatus {
+            status: "pending".into(),
+            flow_id: Some(flow_id),
+            client_id: Some(client_id),
+            authorization_url: None,
+            error: None,
+        };
+        flow.task = Some(task);
+        drop(flow);
+
+        if let Ok(Ok(authorization_url)) =
+            tokio::time::timeout(OAUTH_URL_TIMEOUT, url_receiver).await
+        {
+            let mut flow = self.oauth_flow.lock().await;
+            if flow.status.status == "pending" {
+                flow.status.authorization_url = Some(authorization_url);
+            }
+        }
+        Ok(self.oauth_status().await)
+    }
+
+    async fn connect_oauth(self: &Arc<Self>, oauth: OAuth) -> anyhow::Result<ConnectionStatus> {
+        let access_token = oauth
+            .access_token()
+            .await
+            .context("Longbridge OAuth token unavailable")?;
+        let account_type = token_account_type(&access_token);
+        let config = Arc::new(Config::from_oauth(oauth));
+        self.connect_with_config(config, account_type, "oauth")
+            .await
+    }
+
+    async fn connect_with_config(
         self: &Arc<Self>,
-        credentials: CredentialRequest,
+        config: Arc<Config>,
+        token_account_type: Option<String>,
+        auth_method: &str,
     ) -> anyhow::Result<ConnectionStatus> {
-        credentials.validate().map_err(|message| anyhow!(message))?;
-        let token_account_type = token_account_type(&credentials.access_token);
         {
             let mut state = self.state.write().await;
             state.status.state = "connecting".into();
+            state.status.auth_method = auth_method.into();
             state.status.switch_state = "connecting".into();
             state.status.error = None;
         }
-        let config = Arc::new(Config::from_apikey(
-            credentials.app_key.trim(),
-            credentials.app_secret.trim(),
-            credentials.access_token.trim(),
-        ));
         let (quote, mut receiver) = QuoteContext::new(Arc::clone(&config));
         let (trade, mut trade_receiver) = TradeContext::new(config);
         let validation = async {
@@ -570,6 +722,7 @@ impl LiveManager {
         let status = ConnectionStatus {
             connected: true,
             state: "connected".into(),
+            auth_method: auth_method.into(),
             account_hint: Some(hint),
             quote_level: Some(quote_level),
             packages,
@@ -604,7 +757,24 @@ impl LiveManager {
         Ok(status)
     }
 
+    pub async fn connect(
+        self: &Arc<Self>,
+        credentials: CredentialRequest,
+    ) -> anyhow::Result<ConnectionStatus> {
+        credentials.validate().map_err(|message| anyhow!(message))?;
+        self.cancel_oauth_flow().await;
+        let token_account_type = token_account_type(&credentials.access_token);
+        let config = Arc::new(Config::from_apikey(
+            credentials.app_key.trim(),
+            credentials.app_secret.trim(),
+            credentials.access_token.trim(),
+        ));
+        self.connect_with_config(config, token_account_type, "apikey")
+            .await
+    }
+
     pub async fn disconnect(&self) -> ConnectionStatus {
+        self.cancel_oauth_flow().await;
         let mut state = self.state.write().await;
         state.engine = None;
         state.active = None;

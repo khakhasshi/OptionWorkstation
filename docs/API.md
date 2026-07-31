@@ -2,7 +2,31 @@
 
 Option Workstation exposes a local HTTP API on the configured loopback port.
 The API is intended for the bundled frontend and local research automation; it
-is not an authenticated public service.
+does not provide application-user authentication. Longbridge OAuth below is
+provider authorization for the local live-data connection, not public user
+login.
+
+## Longbridge OAuth 2.0
+
+`POST /api/oauth/start` starts a browser-based Longbridge authorization flow.
+The request body is:
+
+```json
+{"client_id":"your-longbridge-oauth-client-id"}
+```
+
+The response contains a flow status and, once the local callback server is
+ready, an `authorization_url`. It never contains an access token. The browser
+should open that URL in a new tab and poll the status endpoint:
+
+`GET /api/oauth/status`
+
+The status is one of `idle`, `pending`, `connecting`, `connected`, or `error`.
+The OAuth callback listens on `127.0.0.1:60355` and the token is held only by
+the in-process SDK configuration. Tokens are not written to the OAuth crate's
+default file storage. Starting a new flow or disconnecting cancels a pending
+flow. This mechanism does not add authentication or authorization to the
+HTTP API, so public or multi-user deployments remain unsupported.
 
 ## Point-in-time replay snapshot
 
