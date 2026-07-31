@@ -243,6 +243,25 @@ pub struct SurfaceSnapshot {
     pub arbitrage: SurfaceArbitrage,
 }
 
+/// A point-in-time bundle used by the workstation as the authoritative replay
+/// unit. The individual legacy endpoints remain available for compatibility,
+/// but new clients should consume this envelope so all panels share one id and
+/// one as-of timestamp.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplaySnapshot {
+    pub kind: &'static str,
+    pub snapshot_id: String,
+    pub symbol: String,
+    pub date: String,
+    pub minute: String,
+    pub expiration: String,
+    pub as_of: String,
+    pub model_version: String,
+    pub chain: ChainSnapshot,
+    pub surface: SurfaceSnapshot,
+    pub volatility: serde_json::Value,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct CredentialRequest {
     pub app_key: String,
@@ -275,6 +294,13 @@ pub struct ConnectionStatus {
     pub packages: Vec<String>,
     pub subscribed_contracts: usize,
     pub last_event_at: Option<String>,
+    pub last_snapshot_at: Option<String>,
+    pub last_snapshot_sequence: Option<u64>,
+    pub latency_ms: Option<i64>,
+    pub stale_after_ms: u64,
+    pub reconnect_count: u64,
+    pub active_symbol: Option<String>,
+    pub switch_state: String,
     pub error: Option<String>,
     pub credential_storage: &'static str,
     pub trade_connected: bool,
@@ -294,6 +320,13 @@ impl Default for ConnectionStatus {
             packages: Vec::new(),
             subscribed_contracts: 0,
             last_event_at: None,
+            last_snapshot_at: None,
+            last_snapshot_sequence: None,
+            latency_ms: None,
+            stale_after_ms: 5_000,
+            reconnect_count: 0,
+            active_symbol: None,
+            switch_state: "idle".into(),
             error: None,
             credential_storage: "process_memory_only",
             trade_connected: false,

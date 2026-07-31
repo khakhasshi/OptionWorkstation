@@ -53,8 +53,11 @@ export default function StrategyWorkbench({
           <Metric label="Margin" value={money(analysis.margin_estimate)} />
           <Metric label="POP" value={analysis.probability_of_profit == null ? '--' : `${analysis.probability_of_profit.toFixed(1)}%`} />
           <Metric label="B/E" value={analysis.break_evens?.map((value) => value.toFixed(1)).join(' · ') || '--'} />
+          <Metric label="入场价差成本" value={money(analysis.entry_spread_cost)} detail={`最大单腿价差 ${analysis.max_leg_spread_pct?.toFixed(1) ?? '--'}%`} />
+          <Metric label="最低报价质量" value={analysis.min_quote_quality?.toFixed(0) ?? '--'} detail="组合腿最低质量分" />
         </div>
         {analysis.blockers?.length > 0 && <div className="risk-blockers">{analysis.blockers.map((blocker) => <span key={blocker}>{blocker}</span>)}</div>}
+        <div className="execution-mode-note">{analysis.execution_mode || 'paper_sequential_guarded'} · 多腿不是原子撮合</div>
         <button className="paper-submit" disabled={!analysis.executable || !tradeAccount?.execution_enabled || !paperEligible} onClick={onPaperSubmit}><Send size={13} />{!paperEligible ? '仅实时模式可提交' : tradeAccount?.execution_enabled ? '提交纸面组合' : '纸面执行已锁定'}</button>
       </>}
     </div>

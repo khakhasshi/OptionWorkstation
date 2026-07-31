@@ -39,6 +39,20 @@ try {
   const scenarioCells = await page.$$eval('.scenario-matrix td', (cells) => cells.length)
   if (scenarioCells !== 15) throw new Error(`strategy scenario matrix has ${scenarioCells} cells`)
 
+  const dateSelect = await page.$('.date-select:not(.compact)')
+  const availableDates = await page.$$eval('.date-select:not(.compact) option', (options) => options.map((option) => option.value))
+  const alternateDate = availableDates.find((value) => value !== availableDates.at(-1))
+  if (dateSelect && alternateDate) {
+    await page.select('.date-select:not(.compact)', alternateDate)
+    await page.waitForFunction(
+      (date) => document.querySelector('.market-heading .eyebrow')?.textContent?.includes(date),
+      { timeout: 20_000 },
+      alternateDate,
+    )
+    await page.waitForSelector('.chain-table .add-leg', { timeout: 20_000 })
+    if (errors.length) throw new Error(`date switch regression: ${errors.join('\n')}`)
+  }
+
   await page.waitForSelector('.surface-chart canvas', { timeout: 30_000 })
   const surface = await page.$('.surface-chart')
   await surface.evaluate((element) => element.scrollIntoView({ block: 'center' }))

@@ -31,7 +31,7 @@ use crate::{
     audit::{AuditCaptureRequest, AuditStore},
     live::{LiveManager, option_retry_after_ms},
     models::{CredentialRequest, LiveSessionRequest},
-    replay::ReplayStore,
+    replay::{ReplaySnapshotParams, ReplayStore},
     strategy::{PaperOrderRequest, StrategyRequest, analyze_strategy},
 };
 
@@ -133,6 +133,21 @@ struct VolatilityQuery {
     trading_date: String,
     minute: String,
     expiration: String,
+}
+
+#[derive(Deserialize)]
+struct ReplaySnapshotQuery {
+    symbol: String,
+    #[serde(rename = "date")]
+    trading_date: String,
+    minute: String,
+    expiration: String,
+    #[serde(default = "default_pricing_mode")]
+    pricing_mode: String,
+    #[serde(default = "default_dealer_model")]
+    dealer_model: String,
+    #[serde(default = "default_max_dte")]
+    max_dte: i64,
 }
 
 #[derive(Deserialize)]
@@ -248,6 +263,30 @@ async fn volatility_context(
             &query.minute,
             &query.expiration,
         )
+        .map(Json)
+        .map_err(ApiError::bad_request)
+}
+
+async fn replay_snapshot(
+    State(state): State<AppState>,
+    Query(query): Query<ReplaySnapshotQuery>,
+) -> Result<Json<Value>, ApiError> {
+    validate_minute(&query.minute)?;
+    if !(1..=1000).contains(&query.max_dte) {
+        return Err(ApiError::bad_request("max_dte must be between 1 and 1000"));
+    }
+    state
+        .replay
+        .snapshot(ReplaySnapshotParams {
+            symbol: &query.symbol,
+            trading_date: &query.trading_date,
+            minute: &query.minute,
+            expiration: &query.expiration,
+            pricing_mode: &query.pricing_mode,
+            dealer_model: &query.dealer_model,
+            max_dte: query.max_dte,
+        })
+        .and_then(|value| serde_json::to_value(value).map_err(anyhow::Error::from))
         .map(Json)
         .map_err(ApiError::bad_request)
 }
@@ -564,6 +603,8 @@ fn app(state: AppState, frontend_dist: PathBuf) -> Router {
         .route("/api/chain", get(chain))
         .route("/api/surface", get(surface))
         .route("/api/volatility-context", get(volatility_context))
+        .route("/api/replay/snapshot", get(replay_snapshot))
+        .route("/api/v1/replay/snapshot", get(replay_snapshot))
         .route(
             "/api/connection",
             get(connection_status)

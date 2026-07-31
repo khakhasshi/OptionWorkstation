@@ -74,6 +74,7 @@ function App() {
   const [chain, setChain] = useState(null)
   const [surface, setSurface] = useState(null)
   const [volContext, setVolContext] = useState(null)
+  const [snapshotMeta, setSnapshotMeta] = useState(null)
   const [pricingMode, setPricingMode] = useState('micro')
   const [dealerModel, setDealerModel] = useState('classic')
   const [smileAxis, setSmileAxis] = useState('strike')
@@ -87,6 +88,15 @@ function App() {
   const [compareChain, setCompareChain] = useState(null)
   const [webgl] = useState(detectWebGL)
   const [layout, setLayout] = useState(() => localStorage.getItem('option-workstation-layout') || 'dense')
+  const [workspaces, setWorkspaces] = useState(() => {
+    try {
+      const value = JSON.parse(localStorage.getItem('option-workstation-workspaces') || '[]')
+      return Array.isArray(value) ? value : []
+    } catch {
+      return []
+    }
+  })
+  const [workspaceId, setWorkspaceId] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [connection, setConnection] = useState({ connected: false, state: 'disconnected', packages: [], subscribed_contracts: 0 })
@@ -95,6 +105,7 @@ function App() {
   const [liveSymbolDraft, setLiveSymbolDraft] = useState('SPY')
   const [liveFeed, setLiveFeed] = useState(null)
   const [liveSocketState, setLiveSocketState] = useState('idle')
+  const [liveReconnectCount, setLiveReconnectCount] = useState(0)
   const [liveSwitch, setLiveSwitch] = useState(null)
   const [liveSettings, setLiveSettings] = useState({ max_contracts: 420, surface_expiries: 4, moneyness_window: 0.12 })
   const [tradeAccount, setTradeAccount] = useState(null)
@@ -105,6 +116,8 @@ function App() {
   const liveSequenceRef = useRef(-1)
   const pendingLiveSymbolRef = useRef(null)
   const liveRequestRef = useRef({ id: 0, controller: null, timer: null })
+  const replaySnapshotRequestRef = useRef({ id: 0, controller: null })
+  const pendingWorkspaceFrameRef = useRef(null)
 
   const refreshAudit = useCallback(async () => {
     const records = await api('/api/audit/records?limit=50')
@@ -166,6 +179,7 @@ function App() {
     setExpiration(data.feed.expiration)
     setTradingDate(data.chain.date)
     setChain(data.chain)
+    setSnapshotMeta({ snapshot_id: data.chain.snapshot_id, as_of: data.chain.timestamp, model_version: data.chain.provenance?.model })
     const surfaceKey = `${symbol}:${data.feed.expiration}:${data.feed.subscribed_contracts}:${data.feed.expirations.join(',')}`
     const now = Date.now()
     if (surfaceUpdateRef.current.key !== surfaceKey || now - surfaceUpdateRef.current.at >= 2000) {
@@ -212,6 +226,7 @@ function App() {
     setSession(null)
     setChain(null)
     setSurface(null)
+    setSnapshotMeta(null)
     surfaceUpdateRef.current = { at: 0, key: '' }
     setVolContext(null)
     setFocusStrike(null)
@@ -259,6 +274,8 @@ function App() {
       liveSequenceRef.current = -1
       setLiveFeed(null)
       setLiveSocketState('idle')
+      setLiveReconnectCount(0)
+      setSnapshotMeta(null)
       if (mode === 'live') {
         setSession(null)
         setChain(null)
@@ -362,6 +379,7 @@ function App() {
       socket.onerror = () => socket.close()
       socket.onclose = () => {
         if (stopped) return
+        setLiveReconnectCount((count) => count + 1)
         setLiveSocketState('reconnecting')
         retryTimer = window.setTimeout(connect, 1500)
       }
@@ -383,7 +401,9 @@ function App() {
     api(`/api/session?symbols=${symbols.join(',')}&date=${tradingDate}`, controller.signal)
       .then((data) => {
         setSession(data)
-        setFrame(Math.min(1, data.timeline.length - 1))
+        const requestedFrame = pendingWorkspaceFrameRef.current
+        pendingWorkspaceFrameRef.current = null
+        setFrame(Math.min(Math.max(0, requestedFrame ?? 1), data.timeline.length - 1))
         setPlaying(false)
         const expirations = data.series[activeSymbol]?.expirations || []
         setExpiration(expirations.find((item) => (new Date(item) - new Date(tradingDate)) / 86400000 >= 7) || expirations[0] || '')
@@ -416,35 +436,39 @@ function App() {
 
   useEffect(() => {
     if (mode !== 'replay' || !minute || !expiration || !activeSymbol) return
+    const previous = replaySnapshotRequestRef.current
+    previous.controller?.abort()
     const controller = new AbortController()
+    const requestId = previous.id + 1
+    replaySnapshotRequestRef.current = { id: requestId, controller }
     const timer = window.setTimeout(() => {
-      api(`/api/chain?symbol=${activeSymbol}&date=${tradingDate}&minute=${minute}&expiration=${expiration}&pricing_mode=${pricingMode}&dealer_model=${dealerModel}`, controller.signal)
-        .then(setChain)
-        .catch((reason) => reason.name !== 'AbortError' && setError(reason.message))
+      const params = new URLSearchParams({
+        symbol: activeSymbol,
+        date: tradingDate,
+        minute,
+        expiration,
+        pricing_mode: pricingMode,
+        dealer_model: dealerModel,
+        max_dte: '180',
+      })
+      api(`/api/v1/replay/snapshot?${params.toString()}`, controller.signal)
+        .then((data) => {
+          if (replaySnapshotRequestRef.current.id !== requestId) return
+          setChain(data.chain || null)
+          setSurface(data.surface || null)
+          setVolContext(data.volatility || null)
+          setSnapshotMeta({ snapshot_id: data.snapshot_id, as_of: data.as_of, model_version: data.model_version })
+          setError('')
+        })
+        .catch((reason) => {
+          if (reason.name !== 'AbortError' && replaySnapshotRequestRef.current.id === requestId) setError(reason.message)
+        })
     }, playing ? 100 : 0)
     return () => {
       window.clearTimeout(timer)
       controller.abort()
     }
-  }, [mode, activeSymbol, tradingDate, minute, expiration, pricingMode, dealerModel])
-
-  useEffect(() => {
-    if (mode !== 'replay' || !minute) return
-    const controller = new AbortController()
-    api(`/api/surface?symbol=${activeSymbol}&date=${tradingDate}&minute=${minute}&max_dte=180`, controller.signal)
-      .then(setSurface)
-      .catch((reason) => reason.name !== 'AbortError' && setError(reason.message))
-    return () => controller.abort()
-  }, [mode, activeSymbol, tradingDate, expiration, Boolean(session), Math.floor(frame / 5)])
-
-  useEffect(() => {
-    if (mode !== 'replay' || !minute || !expiration) return
-    const controller = new AbortController()
-    api(`/api/volatility-context?symbol=${activeSymbol}&date=${tradingDate}&minute=${minute}&expiration=${expiration}`, controller.signal)
-      .then(setVolContext)
-      .catch((reason) => reason.name !== 'AbortError' && setError(reason.message))
-    return () => controller.abort()
-  }, [mode, activeSymbol, tradingDate, expiration])
+  }, [mode, activeSymbol, tradingDate, minute, expiration, pricingMode, dealerModel, playing])
 
   useEffect(() => {
     if (mode !== 'live' || !liveFeed || !connection.connected) return undefined
@@ -510,17 +534,17 @@ function App() {
     const xValue = (row) => smileAxis === 'delta' ? row.delta : (smileAxis === 'moneyness' ? row.log_moneyness : row.strike)
     const make = (right, color) => ({
       name: right === 'CALL' ? 'Call IV' : 'Put IV', type: 'line', showSymbol: true, symbolSize: 5,
-      data: chain.rows.filter((row) => row.right === right && row.moneyness >= 0.75 && row.moneyness <= 1.25 && row.quality_score >= 25).map((row) => [xValue(row), row.iv]),
+      data: (chain.rows || []).filter((row) => row.right === right && row.moneyness >= 0.75 && row.moneyness <= 1.25 && row.quality_score >= 25).map((row) => [xValue(row), row.iv]),
       lineStyle: { color, width: 1.8 }, itemStyle: { color },
     })
-    const fitted = smileAxis !== 'delta' && chain.svi ? [{ name: 'SVI', type: 'line', showSymbol: false, data: chain.svi.curve.map((row) => [smileAxis === 'strike' ? chain.forward * row.moneyness : Math.log(row.moneyness), row.iv]), lineStyle: { color: '#f1c75b', width: 2.1 } }] : []
+    const fitted = smileAxis !== 'delta' && chain.svi ? [{ name: 'SVI', type: 'line', showSymbol: false, data: (chain.svi.curve || []).map((row) => [smileAxis === 'strike' ? chain.forward * row.moneyness : Math.log(row.moneyness), row.iv]), lineStyle: { color: '#f1c75b', width: 2.1 } }] : []
     return { animation: false, tooltip: { trigger: 'axis', backgroundColor: '#111920', borderColor: '#34414d' }, legend: { top: 4, right: 8, textStyle: { color: '#8d9aa5' } }, grid: { left: 52, right: 18, top: 36, bottom: 34 }, xAxis: { type: 'value', name: smileAxis === 'delta' ? 'Delta' : smileAxis === 'moneyness' ? 'ln(K/F)' : 'Strike', nameTextStyle: { color: '#778590' }, scale: true, ...axis }, yAxis: { type: 'value', name: 'IV %', nameTextStyle: { color: '#778590' }, scale: true, ...axis }, series: [make('CALL', '#54d6b6'), make('PUT', '#ff7e8a'), ...fitted] }
   }, [chain, smileAxis])
 
   const residualOption = useMemo(() => chain?.svi ? ({
     animation: false, grid: { left: 45, right: 12, top: 18, bottom: 28 }, tooltip: { trigger: 'axis', backgroundColor: '#111920', borderColor: '#34414d' },
     xAxis: { type: 'value', name: 'ln(K/F)', scale: true, ...axis }, yAxis: { type: 'value', name: 'IV Δ', ...axis },
-    series: [{ type: 'bar', data: chain.svi.residuals.map((row) => [row.k, row.residual]), itemStyle: { color: (params) => params.value[1] >= 0 ? '#37c99b' : '#ef6673' } }],
+    series: [{ type: 'bar', data: (chain.svi.residuals || []).map((row) => [row.k, row.residual]), itemStyle: { color: (params) => params.value[1] >= 0 ? '#37c99b' : '#ef6673' } }],
   }) : null, [chain])
 
   const gexOption = useMemo(() => chain ? ({
@@ -533,7 +557,7 @@ function App() {
   const exposureOption = useMemo(() => {
     if (!chain?.quality?.gex_ready) return null
     const grouped = new Map()
-    chain.rows.forEach((row) => {
+    ;(chain.rows || []).forEach((row) => {
       const value = grouped.get(row.strike) || { strike: row.strike, gex: 0, vanna: 0, charm: 0 }
       const sign = row.right === 'CALL' ? 1 : -1
       value.gex += row.gex || 0
@@ -551,21 +575,21 @@ function App() {
 
   const volOption = useMemo(() => volContext ? ({
     animation: false, grid: { left: 42, right: 12, top: 18, bottom: 28 }, tooltip: { trigger: 'axis', backgroundColor: '#111920', borderColor: '#34414d' },
-    xAxis: { type: 'category', data: volContext.history.map((row) => row.date.slice(5)), ...axis }, yAxis: { type: 'value', scale: true, ...axis },
-    series: [{ type: 'line', showSymbol: false, data: volContext.history.map((row) => row.iv), lineStyle: { color: '#b395ff', width: 1.8 }, areaStyle: { color: 'rgba(179,149,255,.08)' } }],
+    xAxis: { type: 'category', data: (volContext.history || []).map((row) => row.date.slice(5)), ...axis }, yAxis: { type: 'value', scale: true, ...axis },
+    series: [{ type: 'line', showSymbol: false, data: (volContext.history || []).map((row) => row.iv), lineStyle: { color: '#b395ff', width: 1.8 }, areaStyle: { color: 'rgba(179,149,255,.08)' } }],
   }) : null, [volContext])
 
   const surfaceOption = useMemo(() => !surface ? null : !webgl ? ({
     animation: false,
     tooltip: { position: 'top', backgroundColor: '#111920', borderColor: '#34414d' },
     grid: { left: 58, right: 78, top: 20, bottom: 38 },
-    xAxis: { type: 'category', name: 'Moneyness', data: surface.grid[0]?.map((cell) => cell[0].toFixed(3)) || [], ...axis },
-    yAxis: { type: 'category', name: 'DTE', data: surface.grid.map((row) => `${row[0][1]}D`), ...axis },
+    xAxis: { type: 'category', name: 'Moneyness', data: surface.grid?.[0]?.map((cell) => cell[0].toFixed(3)) || [], ...axis },
+    yAxis: { type: 'category', name: 'DTE', data: (surface.grid || []).map((row) => `${row[0][1]}D`), ...axis },
     visualMap: { min: 10, max: 150, calculable: true, orient: 'vertical', right: 4, top: 20, textStyle: { color: '#8d9aa5' }, inRange: { color: ['#183c56', '#2b8f91', '#e3c65f', '#d95d6c'] } },
-    series: [{ type: 'heatmap', data: surface.grid.flatMap((row, y) => row.map((cell, x) => [x, y, cell[2]])), emphasis: { itemStyle: { borderColor: '#dce5ec', borderWidth: 1 } } }],
+    series: [{ type: 'heatmap', data: (surface.grid || []).flatMap((row, y) => row.map((cell, x) => [x, y, cell[2]])), emphasis: { itemStyle: { borderColor: '#dce5ec', borderWidth: 1 } } }],
   }) : ({
     animation: false, tooltip: {}, backgroundColor: 'transparent',
-    visualMap: { show: true, min: 10, max: Math.min(150, Math.max(...surface.points.map((point) => point.iv), 80)), calculable: true, orient: 'horizontal', left: 20, bottom: 4, textStyle: { color: '#8d9aa5' }, inRange: { color: ['#183c56', '#2b8f91', '#e3c65f', '#d95d6c'] } },
+    visualMap: { show: true, min: 10, max: Math.min(150, Math.max(...(surface.points || []).map((point) => point.iv), 80)), calculable: true, orient: 'horizontal', left: 20, bottom: 4, textStyle: { color: '#8d9aa5' }, inRange: { color: ['#183c56', '#2b8f91', '#e3c65f', '#d95d6c'] } },
     xAxis3D: { type: 'value', name: 'Moneyness', min: 0.75, max: 1.25, axisLabel: { color: '#83909c' } },
     yAxis3D: { type: 'value', name: 'DTE', axisLabel: { color: '#83909c' } },
     zAxis3D: { type: 'value', name: 'IV %', min: 0, max: 150, axisLabel: { color: '#83909c' } },
@@ -585,7 +609,7 @@ function App() {
         name: 'Observed',
         type: 'scatter3D',
         symbolSize: 2.2,
-        data: surface.points.filter((point, index) => index % 4 === 0 && point.iv <= 150).map((point) => [point.moneyness, point.tte_days, point.iv]),
+        data: (surface.points || []).filter((point, index) => index % 4 === 0 && point.iv <= 150).map((point) => [point.moneyness, point.tte_days, point.iv]),
         itemStyle: { color: '#dce5ec', opacity: 0.34 },
       },
     ],
@@ -595,9 +619,9 @@ function App() {
     animation: false,
     tooltip: { trigger: 'axis', backgroundColor: '#111920', borderColor: '#34414d' },
     grid: { left: 58, right: 26, top: 28, bottom: 42 },
-    xAxis: { type: 'category', data: surface.term.map((point) => `${point.dte}D`), ...axis },
+    xAxis: { type: 'category', data: (surface.term || []).map((point) => `${point.dte}D`), ...axis },
     yAxis: [{ type: 'value', name: 'ATM IV %', nameTextStyle: { color: '#778590' }, scale: true, ...axis }, { type: 'value', name: 'GEX', axisLabel: { formatter: formatCompact, color: '#83909c' }, splitLine: { show: false } }],
-    series: [{ name: 'ATM IV', type: 'line', data: surface.term.map((point) => point.iv), showSymbol: true, symbolSize: 6, lineStyle: { color: '#70a5ff', width: 2 }, itemStyle: { color: '#70a5ff' }, areaStyle: { color: 'rgba(112,165,255,.10)' } }, { name: 'Expiry GEX', type: 'bar', yAxisIndex: 1, data: surface.term.map((point) => point.net_gex), itemStyle: { color: 'rgba(84,214,182,.3)' } }],
+    series: [{ name: 'ATM IV', type: 'line', data: (surface.term || []).map((point) => point.iv), showSymbol: true, symbolSize: 6, lineStyle: { color: '#70a5ff', width: 2 }, itemStyle: { color: '#70a5ff' }, areaStyle: { color: 'rgba(112,165,255,.10)' } }, { name: 'Expiry GEX', type: 'bar', yAxisIndex: 1, data: (surface.term || []).map((point) => point.net_gex), itemStyle: { color: 'rgba(84,214,182,.3)' } }],
   }) : null, [surface])
 
   const liveStrategyLegs = useMemo(() => strategyLegs.map((leg) => {
@@ -710,13 +734,77 @@ function App() {
 
   const exportSnapshot = () => {
     if (!chain || !minute) return
-    const payload = { chain, surface, volatility: volContext, strategy: strategyAnalysis, compare: compareMetrics }
+    const payload = {
+      kind: 'option_workstation_export',
+      exported_at: new Date().toISOString(),
+      workspace_id: workspaceId || null,
+      workspace: { mode, symbols, activeSymbol, tradingDate, frame, minute, expiration, pricingMode, dealerModel, layout, smileAxis, strategyLegs, strategyQuantity },
+      snapshot: snapshotMeta,
+      chain,
+      surface,
+      volatility: volContext,
+      strategy: strategyAnalysis,
+      compare: compareMetrics,
+    }
     const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' }))
     const anchor = document.createElement('a')
     anchor.href = url
     anchor.download = `${activeSymbol}-${tradingDate}-${minute.replace(':', '')}-snapshot.json`
     anchor.click()
     URL.revokeObjectURL(url)
+  }
+
+  const saveWorkspace = () => {
+    const defaultName = `${activeSymbol} ${tradingDate || 'live'} ${minute || ''}`.trim()
+    const name = window.prompt('为当前研究工作区命名', defaultName)
+    if (!name?.trim()) return
+    const workspace = {
+      id: globalThis.crypto?.randomUUID?.() || `workspace-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      name: name.trim(),
+      saved_at: new Date().toISOString(),
+      mode,
+      symbols,
+      activeSymbol,
+      tradingDate,
+      frame,
+      expiration,
+      pricingMode,
+      dealerModel,
+      layout,
+      smileAxis,
+      strategyLegs,
+      strategyQuantity,
+      snapshot_id: snapshotMeta?.snapshot_id || chain?.snapshot_id || null,
+    }
+    const next = [workspace, ...workspaces.filter((item) => item.id !== workspaceId)].slice(0, 20)
+    setWorkspaces(next)
+    setWorkspaceId(workspace.id)
+    localStorage.setItem('option-workstation-workspaces', JSON.stringify(next))
+  }
+
+  const restoreWorkspace = (id) => {
+    if (!id) return
+    const workspace = workspaces.find((item) => item.id === id)
+    if (!workspace) return
+    setWorkspaceId(id)
+    setMode(workspace.mode || 'replay')
+    const url = new URL(window.location.href)
+    url.searchParams.set('mode', workspace.mode || 'replay')
+    window.history.replaceState({}, '', url)
+    setPlaying(false)
+    setSymbols(workspace.symbols?.length ? workspace.symbols : ['SPY'])
+    setActiveSymbol(workspace.activeSymbol || workspace.symbols?.[0] || 'SPY')
+    setTradingDate(workspace.tradingDate || '')
+    setExpiration(workspace.expiration || '')
+    setPricingMode(workspace.pricingMode || 'micro')
+    setDealerModel(workspace.dealerModel || 'classic')
+    setLayout(workspace.layout || 'dense')
+    setSmileAxis(workspace.smileAxis || 'strike')
+    setStrategyLegs(Array.isArray(workspace.strategyLegs) ? workspace.strategyLegs : [])
+    setStrategyQuantity(workspace.strategyQuantity || 1)
+    pendingWorkspaceFrameRef.current = Number.isFinite(workspace.frame) ? workspace.frame : 0
+    if (workspace.mode === 'live') pendingWorkspaceFrameRef.current = null
+    if (workspace.mode === 'live') setLiveSymbolDraft(workspace.activeSymbol || 'SPY')
   }
   const addStrategyLeg = (row) => {
     setStrategyLegs((current) => current.some((leg) => leg.strike === row.strike && leg.right === row.right) ? current : [...current, { symbol: row.symbol, strike: row.strike, right: row.right, side: 'BUY', ratio: 1 }])
@@ -784,6 +872,8 @@ function App() {
           <select className="date-select compact" value={pricingMode} onChange={(event) => setPricingMode(event.target.value)}><option value="micro">Micro</option><option value="mid">Mid</option><option value="ask">Ask</option></select>
           <select className="date-select compact" value={dealerModel} onChange={(event) => setDealerModel(event.target.value)}><option value="classic">Call+/Put-</option><option value="short_all">Dealer Short</option><option value="long_all">Dealer Long</option></select>
           <div className="segments layout-switch" aria-label="工作台布局">{[['dense', '总览'], ['vol', '波动率'], ['trade', '交易']].map(([value, label]) => <button key={value} className={layout === value ? 'active' : ''} onClick={() => setLayout(value)}>{label}</button>)}</div>
+          <select className="workspace-select" value={workspaceId} onChange={(event) => restoreWorkspace(event.target.value)} title="恢复研究工作区"><option value="">工作区</option>{workspaces.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select>
+          <button className="icon-button action" title="保存研究工作区" onClick={saveWorkspace}><Bookmark size={15} /></button>
           <a className="icon-button action" href="/guide.html" title="打开初学者指南" aria-label="打开初学者指南"><BookOpen size={15} /></a>
           <button className="icon-button action" title="写入审计账本" onClick={() => captureAudit()}><Bookmark size={15} /></button>
           <button className="icon-button action" title="导出研究快照" onClick={exportSnapshot}><Download size={15} /></button>
@@ -801,6 +891,7 @@ function App() {
         <aside className="workspace-panel snapshot-panel">
           <div className="panel-title"><span>期权截面 <small>{chain?.provenance?.source || '--'}</small></span><select value={expiration} onChange={(event) => setExpiration(event.target.value)}>{session?.series[activeSymbol]?.expirations.map((item) => <option key={item} value={item}>{item} · {Math.max(0, Math.round((new Date(`${item}T16:00:00`) - new Date(`${tradingDate}T09:30:00`)) / 86400000))}D</option>)}</select></div>
           <div className={`quality-banner ${chainQualityReady ? 'ready' : 'limited'}`}><span>{chainQualityLabel}</span><b>Q {chain?.quality?.quote_coverage_pct?.toFixed(0) ?? '--'} · Fresh {chain?.quality?.fresh_quote_coverage_pct?.toFixed(0) ?? '--'} · Meta {chain?.quality?.metadata_coverage_pct?.toFixed(0) ?? '--'}%</b></div>
+          <div className="snapshot-provenance" title="所有主分析面板使用同一截面快照"><span>Snapshot {snapshotMeta?.snapshot_id?.slice(0, 14) || chain?.snapshot_id?.slice(0, 14) || '--'}</span><span>{snapshotMeta?.model_version || chain?.provenance?.model || '--'}</span><span>{snapshotMeta?.as_of ? new Date(snapshotMeta.as_of).toLocaleTimeString('zh-CN', { hour12: false, timeZone: 'America/New_York' }) : '--:--:--'} ET</span></div>
           <div className="metric-grid">
             <Metric label="Spot" value={chain?.spot?.toFixed(2)} />
             <Metric label="ATM IV" value={chain?.metrics?.atm_iv ? `${chain.metrics.atm_iv.toFixed(1)}%` : '--'} />
@@ -874,6 +965,7 @@ function App() {
           <LiveReadout label="OI 覆盖" value={`${liveFeed?.metadata_coverage_pct?.toFixed(0) ?? 0}%`} tone={liveFeed?.metadata_coverage_pct >= 90 ? 'healthy' : 'warning'} />
           <LiveReadout label="传输延迟" value={liveFeed?.latency_ms == null ? '--' : `${liveFeed.latency_ms} ms`} tone={liveFeed?.latency_ms < 3000 ? 'healthy' : 'warning'} />
           <LiveReadout label="质量状态" value={liveFeed?.quality_state || '--'} tone={liveFeed?.quality_state === 'ready' ? 'healthy' : 'warning'} />
+          <LiveReadout label="重连次数" value={String(liveReconnectCount)} tone={liveReconnectCount === 0 ? 'healthy' : 'warning'} />
         </div>
         <div className="live-settings">
           <label title="期权订阅上限"><span>合约</span><input type="number" min="20" max="480" step="20" value={liveSettings.max_contracts} onChange={(event) => setLiveSettings((current) => ({ ...current, max_contracts: Number(event.target.value) }))} /></label>

@@ -1,0 +1,163 @@
+\documentclass[UTF8,a4paper,11pt]{ctexart}
+
+\usepackage[a4paper,margin=1.65cm]{geometry}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{fancyhdr}
+\usepackage{longtable}
+
+\definecolor{ink}{HTML}{17313B}
+\definecolor{teal}{HTML}{16796B}
+\definecolor{muted}{HTML}{64727A}
+\definecolor{soft}{HTML}{EEF5F4}
+\definecolor{warn}{HTML}{8E5A12}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=teal,
+  urlcolor=teal,
+  pdftitle={Option Workstation 历史回放交易辅助决策案例},
+  pdfauthor={JIANGJINGZHE 江景哲},
+}
+\setlist{itemsep=2pt,topsep=3pt}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{5pt}
+\setlength{\headheight}{14pt}
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{Option Workstation}
+\rhead{历史回放案例}
+\cfoot{\thepage}
+
+\newcommand{\metric}[2]{\textbf{#1：}#2}
+\newcommand{\caseimage}[2]{%
+  \begin{figure}[H]
+    \centering
+    \includegraphics[width=\linewidth]{assets/case-studies/#1}
+    \caption{#2}
+  \end{figure}}
+
+\title{\vspace{-1.1cm}\textcolor{ink}{Option Workstation\\历史回放交易辅助决策案例}}
+\author{JIANGJINGZHE 江景哲\\\href{mailto:jiangjingzhe2004@gmail.com}{jiangjingzhe2004@gmail.com}}
+\date{2026 年 7 月 31 日}
+
+\begin{document}
+\maketitle
+
+\begin{center}
+\colorbox{soft}{\parbox{0.94\linewidth}{\textbf{文档定位。} 本文只使用开源项目 Option Workstation 当前本机连接的 ThetaData 回放数据和 workstation 自己的 Rust 分析接口。文中的“辅助判断”是对一个历史截面的可复核解释，不是自动下单记录、收益承诺或投资建议。}}
+\end{center}
+
+\section{摘要}
+
+Option Workstation 的核心价值不是给出一个不可解释的“买入/卖出”按钮，而是把期权判断拆成几个可以被数据推翻的门槛：报价是否可用、波动率是否昂贵、Dealer 暴露是否可能放大价格路径、组合结构是否具备定义风险，以及成交价是否真的可以执行。
+
+本报告从本机 50 个交易日、9 个标的的回放数据中选取两个截面案例。它们分别展示：
+
+\begin{enumerate}
+  \item 低 IV、正 Gamma 环境下避免追买跨式；
+  \item 高 IV 与高 VRP 环境下先比较结构，不盲目追价。
+\end{enumerate}
+
+\textbf{重要边界：} 当前 workstation 审计账本中没有历史回放交易决策流水，只有实时研究快照和系统验证记录。因此下文是“用 workstation 重新回放得到的案例”，不是项目已经保存的自动交易行为。
+
+\section{数据与复现方法}
+
+\begin{tabular}{>{\bfseries}p{0.28\linewidth}p{0.63\linewidth}}
+\toprule
+数据源 & 本机 ThetaData 风格 Parquet 回放数据\\
+覆盖范围 & 2026-04-29 至 2026-07-10，共 50 个交易日\\
+标的 & AAPL、AMZN、GOOGL、META、MSFT、NVDA、QQQ、SPY、TSLA\\
+分析服务 & Option Workstation Rust 后端，默认 Micro 定价与 Call+/Put- Dealer 模型\\
+报价假设 & 买入使用 Ask，卖出使用 Bid；未计佣金、税费和额外滑点\\
+结果性质 & 截面辅助判断 + 事后标的路径对照，不是独立样本外策略回测\\
+\bottomrule
+\end{tabular}
+
+案例截图应在工作台中手动设置对应的标的、日期、到期日和回放时刻后截取，并保存为文档约定的文件名：
+
+\begin{verbatim}
+docs/assets/case-studies/01-spy-low-vol-positive-gamma.png
+docs/assets/case-studies/04-spy-high-vrp.png
+\end{verbatim}
+
+工作台需要先在 `127.0.0.1:7311` 启动，并将\texttt{OPTION\_WORKSTATION\_DATA\_ROOT} 指向授权的本机数据目录。
+
+\section{案例一：SPY 低波动与正 Gamma}
+
+\textbf{时间：} SPY，2026-07-10，10:00 ET。
+
+\begin{tabular}{>{\bfseries}p{0.36\linewidth}p{0.52\linewidth}}
+\toprule
+指标 & workstation 输出\\
+\midrule
+ATM IV & 15.3\%\\
+IV Rank / Percentile & 17.7\% / 26.0\%\\
+RV20 / VRP20 & 15.3\% / 2.52\%\\
+Net GEX & +4.567B\\
+Gamma Flip & 709.14，低于 Spot 752.89\\
+质量 / PCR & 91 / 0.96\\
+报价状态 & Fresh 100\%，元数据 100\%\\
+Expected Move & 3.65\\
+\bottomrule
+\end{tabular}
+
+工作台的辅助判断是：隐含波动率处于低位，VRP20 几乎为零，且 Net GEX 为正，因而不宜仅凭“想赚波动”就追买当日跨式。若仍有方向假设，应先使用定义风险结构，并通过盈亏平衡和可执行报价复核。
+
+回放对照：标的从 752.89 走到 754.87，涨幅约 0.263\%。截图中的 ATM 跨式为买入 753 Call 和 753 Put，两边 Ask 合计约 2.41 美元，即每张组合名义成本约 241 美元；风险引擎显示盈亏平衡区间约为 750.6--755.4 美元，近似胜率 38.1\%。这说明“低 IV、正 Gamma”首先是一个需要谨慎购买波动率的环境，而不是一个自动买入信号。
+
+\caseimage{01-spy-low-vol-positive-gamma.png}{SPY 2026-07-10 10:00 ET：低 IV、正 Gamma、可执行报价和曲面研究状态同时可见。}
+
+\section{案例二：SPY 高 IV 与高 VRP}
+
+\textbf{时间：} SPY，2026-06-17，14:00 ET。
+
+\begin{tabular}{>{\bfseries}p{0.36\linewidth}p{0.52\linewidth}}
+\toprule
+指标 & workstation 输出\\
+\midrule
+ATM IV & 86.5\%\\
+IV Rank / Percentile & 68.7\% / 91.4\%\\
+RV20 / VRP20 & 13.8\% / 19.97\%\\
+Net GEX & +402.6M\\
+质量 / PCR & 77 / 0.54\\
+报价状态 & Fresh 100\%，元数据 100\%\\
+Expected Move & 6.90\\
+曲面状态 & Research projection only，未宣称 Trusted\\
+\bottomrule
+\end{tabular}
+
+这是一个“波动率很贵，但方向仍可能有价值”的场景。工作台不会把高 IV 简化为“卖波动”，而是要求交易员比较方向结构、权利金成本和最大损失。截图显示 25Delta RR 约 +38.11、25Delta BF 约 -36.98，说明不同执行价的波动率定价差异显著；Net GEX 仍为正，但远低于案例一，不能据此推导稳定的价格路径。
+
+观察点之后标的收于 741.02，跌幅约 0.879\%。这可以作为结构研究案例，但不能把事后下跌包装成工作台的预测成功。更稳妥的流程是：先承认高 IV 和高 VRP 带来的权利金风险，再用有限风险结构、盈亏平衡和情景矩阵决定是否值得承担风险；如果曲面可信门禁未通过，则降低仓位或不交易。
+
+\caseimage{04-spy-high-vrp.png}{SPY 2026-06-17 14:00 ET：高 IV、高 VRP、偏度变化和研究曲面状态共同约束交易解释。}
+
+\section{如何把案例用于实际交易流程}
+
+建议交易员每次只按以下顺序推进：
+
+\begin{enumerate}
+  \item 先看 Fresh、NBBO 覆盖率、可用报价率和 OI 覆盖；任何关键门禁失败时，不继续解释 IV 或 GEX。
+  \item 再看 IV Rank、IV Percentile、RV20、VRP20 与 Expected Move，判断是在买方向、买波动，还是承担过高权利金。
+  \item 再看 Net GEX、Gamma Flip、Call/Put Wall，作为路径和风险放大的背景，不当作确定性预测。
+  \item 最后用单腿或有限风险多腿结构计算 Ask/Bid 成交、最大亏损、盈亏平衡、Greeks 和情景矩阵。
+  \item 保存 snapshot ID，并在回放后对照实际标的路径和期权报价；不要只保存盈利案例。
+\end{enumerate}
+
+\section{限制与结论}
+
+本文没有声称 Option Workstation 已经验证出一个稳定盈利的自动交易策略。主要限制包括：美国股票期权的美式行权被 BSM 近似、Dealer 持仓方向不是直接观测量、曲面是稀疏报价上的研究投影、策略成交未包含全部费用和队列冲击，而且这些案例属于历史截面重放，不是冻结参数后的独立样本外检验。
+
+更准确的项目定位是：
+
+\begin{quote}
+Option Workstation 是一个研究优先的期权回放与实时分析工作台。它帮助交易员把“要不要交易、交易什么结构、承担多少风险、当前数据是否值得相信”变成可视化、可复核、可审计的判断过程；当输入不可靠时，明确支持“不交易”。
+\end{quote}
+
+\end{document}

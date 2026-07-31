@@ -50,3 +50,5 @@ coverage/
 *.lcov
 *.tmp
 *.log
+docs/*.aux
+docs/*.out

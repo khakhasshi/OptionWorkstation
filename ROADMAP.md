@@ -12,7 +12,8 @@ This roadmap describes direction, not a delivery promise.
 
 ## 0.2 Reliability
 
-- versioned API schema and generated OpenAPI documentation;
+- [x] versioned replay snapshot contract and API documentation;
+- [x] replay request generation guards and live feed observability;
 - synthetic, redistributable replay fixture for end-to-end CI;
 - deterministic live-event recorder and offline playback;
 - stronger audit-ledger export and verification tooling;
@@ -23,7 +24,8 @@ This roadmap describes direction, not a delivery promise.
 
 ## 0.3 Research Workflow
 
-- named and comparable workspace snapshots;
+- [x] named local research workspaces with restore/export state;
+- [x] executable quote spread and minimum-leg-quality diagnostics;
 - richer cross-expiry and scenario diagnostics;
 - reproducible strategy templates with assumption manifests;
 - research result export without provider-owned raw data.
