@@ -312,13 +312,17 @@ data/
 ## 实时连接
 
 1. 进入工作台并切换到“实时”。
-2. 打开连接面板。
-3. 填入 Longbridge App Key、App Secret 和 Access Token。
+2. 打开连接面板，优先使用 **Longbridge OAuth 2.0**：输入已经注册的 OAuth Client ID，点击开始授权，在浏览器中完成 Longbridge 授权，再回到工作台等待连接状态变为已连接。
+3. 如果当前应用没有 OAuth Client ID，也可以使用兼容模式，填入 Longbridge App Key、App Secret 和 Access Token。
 4. 连接后选择标的与到期日，等待质量门禁通过。
 
-凭证只发送给同源 Rust API，并由 SDK Context 保存在进程内存中。服务不会把凭证
-返回浏览器、写进 localStorage、提交到审计记录或保存到仓库。断开连接或停止进程
+OAuth 回调默认监听本机 `127.0.0.1:60355`。两种认证方式都只把凭证交给同源 Rust API，
+由 Longbridge SDK Context 保存在进程内存中；OAuth Token 不会返回浏览器、写进
+localStorage、提交到审计记录、写入默认 Token 文件或保存到仓库。断开连接或停止进程
 后，内存会话即被清除。
+
+OAuth 是 Longbridge 的**提供商授权方式**，不是本项目的多用户登录系统。服务仍然默认
+只监听本机回环地址，不要把本服务直接暴露到公网。
 
 不要直接把本服务暴露到公网。默认只监听本机回环地址；若确需网络访问，必须先补充
 身份认证、TLS、Origin 限制和主机访问控制。

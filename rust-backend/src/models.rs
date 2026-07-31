@@ -285,10 +285,54 @@ impl CredentialRequest {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct OAuthStartRequest {
+    pub client_id: String,
+}
+
+impl OAuthStartRequest {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let client_id = self.client_id.trim();
+        if client_id.is_empty() {
+            return Err("OAuth Client ID 不能为空");
+        }
+        if client_id.len() > 256
+            || !client_id.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | ':')
+            })
+        {
+            return Err("OAuth Client ID 格式异常");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OAuthStatus {
+    pub status: String,
+    pub flow_id: Option<String>,
+    pub client_id: Option<String>,
+    pub authorization_url: Option<String>,
+    pub error: Option<String>,
+}
+
+impl Default for OAuthStatus {
+    fn default() -> Self {
+        Self {
+            status: "idle".into(),
+            flow_id: None,
+            client_id: None,
+            authorization_url: None,
+            error: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ConnectionStatus {
     pub connected: bool,
     pub state: String,
+    pub auth_method: String,
     pub account_hint: Option<String>,
     pub quote_level: Option<String>,
     pub packages: Vec<String>,
@@ -315,6 +359,7 @@ impl Default for ConnectionStatus {
         Self {
             connected: false,
             state: "disconnected".into(),
+            auth_method: "none".into(),
             account_hint: None,
             quote_level: None,
             packages: Vec::new(),
@@ -399,4 +444,45 @@ pub struct LiveSnapshot {
     pub bars: Vec<Bar>,
     pub chain: ChainSnapshot,
     pub surface: SurfaceSnapshot,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OAuthStartRequest, OAuthStatus};
+
+    #[test]
+    fn oauth_client_id_validation_accepts_provider_ids() {
+        assert!(
+            OAuthStartRequest {
+                client_id: "client-123_abc:v1".into(),
+            }
+            .validate()
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn oauth_client_id_validation_rejects_empty_or_unsafe_values() {
+        assert!(
+            OAuthStartRequest {
+                client_id: "  ".into()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            OAuthStartRequest {
+                client_id: "client id".into(),
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn oauth_status_never_contains_a_token_field() {
+        let json = serde_json::to_value(OAuthStatus::default()).unwrap();
+        assert!(json.get("access_token").is_none());
+        assert_eq!(json["status"], "idle");
+    }
 }

@@ -32,6 +32,10 @@ curl -fsS -X POST "$BASE_URL/api/strategy/analyze" -H 'Content-Type: application
 curl -fsS "$BASE_URL/api/audit/records?limit=5" | jq -e 'type == "array"' >/dev/null
 CONNECTION="$(curl -fsS "$BASE_URL/api/connection")"
 jq -e '.credential_storage == "process_memory_only"' <<<"$CONNECTION" >/dev/null
+OAUTH_STATUS="$(curl -fsS "$BASE_URL/api/oauth/status")"
+jq -e '.status == "idle" and (.authorization_url == null) and (.error == null)' <<<"$OAUTH_STATUS" >/dev/null
+OAUTH_INVALID_STATUS="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$BASE_URL/api/oauth/start" -H 'Content-Type: application/json' --data '{"client_id":"bad client id"}')"
+[[ "$OAUTH_INVALID_STATUS" == "400" ]]
 if [[ "$(jq -r '.connected' <<<"$CONNECTION")" == "true" ]]; then
   STATUS="$(curl -sS -o /dev/null -w '%{http_code}' "$BASE_URL/api/live/snapshot")"
   [[ "$STATUS" == "200" || "$STATUS" == "409" ]]

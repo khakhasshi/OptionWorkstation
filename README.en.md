@@ -70,7 +70,7 @@ The shipped application is served by `rust-backend/`.
 ```mermaid
 flowchart LR
   A["ThetaData Parquet<br/>historical replay"] --> R["Rust analytics server"]
-  B["Longbridge Rust SDK<br/>live quote and paper account"] --> R
+  B["Longbridge OAuth / Rust SDK<br/>live quote and paper account"] --> R
   R --> C["BSM / Greeks / SVI"]
   R --> D["Surface / GEX / volatility context"]
   R --> E["Strategy risk and paper-order gates"]
@@ -94,7 +94,7 @@ trust flows.
 - Node.js 22 and npm
 - Python 3.11+ only if running the legacy parity tests
 - a licensed replay dataset for historical mode
-- optional Longbridge OpenAPI credentials for live mode
+- optional Longbridge OAuth Client ID or OpenAPI credentials for live mode
 
 ### Local
 
@@ -157,14 +157,19 @@ licensing constraints are documented in
 ## Live Mode
 
 1. Open the workstation and select **Live**.
-2. Open the connection dialog.
-3. Enter the Longbridge app key, app secret, and access token.
+2. Open the connection dialog and prefer **Longbridge OAuth 2.0**: enter the
+   registered OAuth Client ID, open the authorization page, and complete the
+   provider consent flow in the browser.
+3. If OAuth is not available for the application, enter the Longbridge app key,
+   app secret, and access token as a compatibility fallback.
 4. Connect, select an underlying and expiry, and wait for quality gates.
 
-Credentials are sent only to the same-origin Rust API and held in SDK contexts
-in process memory. They are never returned to the browser, persisted in local
-storage, written to the repository, or accepted by audit records. Disconnecting
-or stopping the process clears the in-memory session.
+The local OAuth callback listens on `127.0.0.1:60355`. Credentials are sent
+only to the same-origin Rust API and held in SDK contexts in process memory.
+They are never returned to the browser, persisted in local storage, written to
+the repository, or accepted by audit records. Disconnecting or stopping the
+process clears the in-memory session. OAuth is provider authorization, not
+application-user authentication.
 
 Do not expose the service to a network without adding authentication, TLS,
 origin restrictions, and host-level access controls. The default binding is
@@ -213,6 +218,8 @@ credentials through the local same-origin connection dialog only.
 | `/api/chain` | `GET` | Historical executable-price chain and quality gates |
 | `/api/surface` | `GET` | Historical constrained surface and trust report |
 | `/api/volatility-context` | `GET` | Point-in-time IV/RV/VRP/expected move |
+| `/api/oauth/start` | `POST` | Start a Longbridge OAuth provider authorization flow |
+| `/api/oauth/status` | `GET` | Poll OAuth flow state without exposing tokens |
 | `/api/live/session` | `POST`, `DELETE` | Configure or disconnect live SDK session |
 | `/api/live/snapshot` | `GET` | Current normalized live snapshot |
 | `/api/live/stream` | `WS` | Throttled live snapshot stream |

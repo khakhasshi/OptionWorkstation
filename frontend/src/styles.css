@@ -246,6 +246,13 @@ tr.focused { background: #18272e; }
 .trade-connection-grid { display: grid; grid-template-columns: 1fr 1fr; margin: -4px 0 16px; border-top: 1px solid #26323b; border-left: 1px solid #26323b; }
 .trade-connection-grid > div { min-width: 0; display: grid; gap: 4px; padding: 8px 9px; border-right: 1px solid #26323b; border-bottom: 1px solid #26323b; }
 .trade-connection-grid span { color: #687782; font-size: 8px; }.trade-connection-grid b { overflow: hidden; color: #b9c5ce; font-size: 10px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.oauth-section { display: grid; gap: 10px; margin-bottom: 18px; padding: 12px; border: 1px solid #2c5f55; background: #10201d; }
+.oauth-heading { display: flex; align-items: center; justify-content: space-between; }
+.oauth-heading > div { display: flex; align-items: center; gap: 7px; }.oauth-heading svg { color: #54d6b6; }.oauth-heading strong { color: #d5e4e1; font-size: 11px; }.oauth-heading > span { padding: 3px 5px; border: 1px solid #397d6c; color: #75dbc2; font-size: 8px; }
+.oauth-section p { margin: 0; color: #9aaba8; font-size: 9px; line-height: 1.55; }
+.oauth-form { display: grid; gap: 9px; }.oauth-form label { display: grid; gap: 5px; }.oauth-form label > span { color: #91a39f; font-size: 9px; }.oauth-form input { width: 100%; height: 32px; padding: 0 8px; border: 1px solid #31584f; border-radius: 3px; outline: 0; background: #0c1715; color: #d5e5e1; font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; }.oauth-form input:focus { border-color: #54d6b6; box-shadow: 0 0 0 2px #245c5038; }
+.oauth-button { min-height: 32px; display: flex; align-items: center; justify-content: center; gap: 6px; border: 1px solid #3d9f89; border-radius: 3px; background: #267d6b; color: #f1fffb; font-size: 10px; font-weight: 650; }.oauth-button:disabled { cursor: wait; opacity: .65; }
+.oauth-status { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: #b9c8c4; font-size: 9px; line-height: 1.5; }.oauth-status.muted { display: block; color: #9d9e88; }.oauth-status.success { display: block; color: #69d6bd; }.oauth-status.failure { display: block; padding: 7px 8px; border-left: 2px solid #df8c95; color: #ff9aa4; background: #211417; }.oauth-link { color: #75dbc2; font-weight: 650; text-decoration: underline; text-underline-offset: 2px; }
 .credential-form { display: grid; gap: 12px; }
 .credential-form > label { display: grid; gap: 5px; }
 .credential-form > label > span, .package-section > span { color: #8997a1; font-size: 10px; font-weight: 600; }

@@ -30,7 +30,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use crate::{
     audit::{AuditCaptureRequest, AuditStore},
     live::{LiveManager, option_retry_after_ms},
-    models::{CredentialRequest, LiveSessionRequest},
+    models::{CredentialRequest, LiveSessionRequest, OAuthStartRequest},
     replay::{ReplaySnapshotParams, ReplayStore},
     strategy::{PaperOrderRequest, StrategyRequest, analyze_strategy},
 };
@@ -293,6 +293,24 @@ async fn replay_snapshot(
 
 async fn connection_status(State(state): State<AppState>) -> Json<Value> {
     Json(serde_json::to_value(state.live.status().await).expect("serialize connection status"))
+}
+
+async fn oauth_status(State(state): State<AppState>) -> Json<Value> {
+    Json(serde_json::to_value(state.live.oauth_status().await).expect("serialize OAuth status"))
+}
+
+async fn start_oauth(
+    State(state): State<AppState>,
+    Json(request): Json<OAuthStartRequest>,
+) -> Result<Json<Value>, ApiError> {
+    request.validate().map_err(ApiError::bad_request)?;
+    state
+        .live
+        .start_oauth(request.client_id)
+        .await
+        .and_then(|value| serde_json::to_value(value).map_err(anyhow::Error::from))
+        .map(Json)
+        .map_err(ApiError::upstream)
 }
 
 async fn connect_longbridge(
@@ -611,6 +629,8 @@ fn app(state: AppState, frontend_dist: PathBuf) -> Router {
                 .post(connect_longbridge)
                 .delete(disconnect_longbridge),
         )
+        .route("/api/oauth/status", get(oauth_status))
+        .route("/api/oauth/start", post(start_oauth))
         .route("/api/live/session", post(setup_live_session))
         .route("/api/live/snapshot", get(live_snapshot))
         .route("/api/live/volatility-context", get(live_volatility_context))
