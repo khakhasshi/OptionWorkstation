@@ -12,6 +12,7 @@ import {
   Layers3,
   KeyRound,
   LockKeyhole,
+  MessageCircle,
   Pause,
   Play,
   Plus,
@@ -32,6 +33,7 @@ import StrategyWorkbench from './components/StrategyWorkbench'
 import { api, apiJson, websocketUrl } from './lib/api'
 
 const SurfaceChart = lazy(() => import('./components/SurfaceChart'))
+const AssistantDock = lazy(() => import('./components/AssistantDock'))
 const PALETTE = ['#54d6b6', '#70a5ff', '#f1c75b', '#ff7e8a', '#b395ff']
 const SPEEDS = [0.5, 1, 2, 5, 10, 30]
 
@@ -114,6 +116,9 @@ function App() {
   const [orders, setOrders] = useState([])
   const [paperConfirmOpen, setPaperConfirmOpen] = useState(false)
   const [paperConfirmation, setPaperConfirmation] = useState('')
+  const [assistantOpen, setAssistantOpen] = useState(
+    () => localStorage.getItem('option-workstation-assistant-open') === '1',
+  )
   const surfaceUpdateRef = useRef({ at: 0, key: '' })
   const liveSequenceRef = useRef(-1)
   const pendingLiveSymbolRef = useRef(null)
@@ -877,6 +882,24 @@ function App() {
       : chain?.quality?.gex_ready ? '完整截面' : '元数据受限'
   const chartViewKey = `${mode}:${activeSymbol}:${expiration || 'none'}`
   const marketViewKey = `${mode}:${activeSymbol}`
+  const assistantSnapshotRef = useMemo(() => {
+    if (!chain) return null
+    if (mode === 'live') return { kind: 'live' }
+    if (!activeSymbol || !tradingDate || !minute || !expiration) return null
+    return {
+      kind: 'replay',
+      symbol: activeSymbol,
+      date: tradingDate,
+      minute,
+      expiration,
+      pricing_mode: pricingMode,
+      dealer_model: dealerModel,
+      max_dte: 180,
+    }
+  }, [activeSymbol, chain, dealerModel, expiration, minute, mode, pricingMode, tradingDate])
+  const assistantSnapshotLabel = mode === 'live'
+    ? `${activeSymbol} · LIVE · ${minute || '--:--'} ET`
+    : `${activeSymbol} · ${tradingDate} · ${minute || '--:--'} ET · ${expiration}`
   const sviLabel = chain?.svi
     ? 'SVI ready'
     : chain?.svi_diagnostics
@@ -1018,6 +1041,30 @@ function App() {
           <button onClick={startLive} disabled={loading}><RefreshCw size={14} />应用</button>
         </div>
       </footer>}
+
+      {assistantOpen ? <Suspense fallback={<div className="assistant-loading">加载截面助手…</div>}>
+        <AssistantDock
+          currentSnapshotRef={assistantSnapshotRef}
+          currentSnapshotLabel={assistantSnapshotLabel}
+          currentSnapshotReady={Boolean(assistantSnapshotRef && chain)}
+          strategy={strategyAnalysis}
+          auditRecords={auditRecords}
+          onAuditRefresh={refreshAudit}
+          onClose={() => {
+            setAssistantOpen(false)
+            localStorage.setItem('option-workstation-assistant-open', '0')
+          }}
+          onError={setError}
+        />
+      </Suspense> : <button
+        className="assistant-launcher"
+        title="打开截面解盘助手"
+        aria-label="打开截面解盘助手"
+        onClick={() => {
+          setAssistantOpen(true)
+          localStorage.setItem('option-workstation-assistant-open', '1')
+        }}
+      ><MessageCircle size={21} /></button>}
 
       {credentialOpen && <div className="credential-backdrop" onMouseDown={() => setCredentialOpen(false)}>
         <aside className="credential-drawer" role="dialog" aria-modal="true" aria-labelledby="credential-title" onMouseDown={(event) => event.stopPropagation()}>

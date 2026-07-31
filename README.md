@@ -57,6 +57,7 @@ Option Workstation 刻意把这些层次拆开并显示出来：
 | 微笑与曲面 | Call/Put 微笑、SVI、残差、期限结构和约束曲面 | 研究投影，不是严格无套利证明 |
 | 暴露 | GEX、Vanna、Charm、墙位与 Gamma Flip | Dealer 符号是模型假设 |
 | 组合风险 | 多腿可成交计价、到期损益与 Spot/IV/时间情景矩阵 | 多腿并非交易所原子撮合 |
+| 截面助手 | 浮动多轮对话、双截面对比、观点与策略复核 | 只读取冻结证据，不调用交易接口 |
 | 审计 | 凭证字段拒绝、JSONL 哈希链 | 本地完整性辅助，不是第三方公证 |
 | 交易 | 账户与订单监控、严格受控的模拟限价单 | 明确拒绝实盘账户下单 |
 
@@ -138,7 +139,17 @@ Dealer Exposure 描述的是在给定持仓假设下潜在的对冲机制，不�
 - 可选择历史快照进行比较，观察 Spot、ATM IV、RR25 和 Net GEX 的变化。
 - 本地账本适合个人复盘和变更追踪，但不替代第三方时间戳或合规档案系统。
 
-### 8. 面向交易工作的界面
+### 8. 截面解盘助手
+
+- 浮动助手在关闭时按需卸载，不占据图表排版；历史回放和实时模式均可使用。
+- 可附加当前截面、审计账本中的已存截面，或同时附加两个截面解释状态变化。
+- 服务端冻结并压缩期权链、IV/RV/VRP、SVI、曲面、Dealer Exposure、行情窗口、
+  数据质量和策略预览，保留原始链行数与来源标识。
+- 支持多轮追问、观点的支持/反对证据、策略复核和主动收藏；收藏结果进入现有哈希链账本。
+- 系统提示要求模型区分事实、推断与未知，并允许输出“不交易”或“证据不足”。
+- 助手没有下单工具；LLM 凭证只在 Rust 服务端读取，不进入浏览器、快照或审计记录。
+
+### 9. 面向交易工作的界面
 
 - `总览`、`波动率`、`交易` 三种布局用于不同阶段的关注重点。
 - 面板可以折叠，允许在一个屏幕内同时观察更多同步图表。
@@ -350,10 +361,17 @@ OAuth 是 Longbridge 的**提供商授权方式**，不是本项目的多用户�
 | `OPTION_WORKSTATION_RISK_FREE_RATE` | `0.043` | BSM 无风险利率 |
 | `OPTION_WORKSTATION_FRONTEND_DIST` | `./frontend/dist` | 前端构建目录 |
 | `OPTION_WORKSTATION_AUDIT_PATH` | `~/.option-workstation/audit.jsonl` | 追加式审计记录 |
+| `OPTION_WORKSTATION_LLM_API_KEY` | 未设置 | OpenAI-compatible 服务端密钥 |
+| `OPTION_WORKSTATION_LLM_MODEL` | 未设置 | 助手模型名；与 Key 同时设置才启用 |
+| `OPTION_WORKSTATION_LLM_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible API 根地址 |
+| `OPTION_WORKSTATION_LLM_MOCK` | 未设置 | 仅用于本地流式集成测试 |
 | `OPTION_WORKSTATION_PAPER_ORDER_EXECUTION` | 未设置 | 模拟下单服务端总开关 |
 | `RUST_LOG` | `option_workstation=info,tower_http=info` | 日志过滤器 |
 
-不要把 Longbridge 凭证写进 `.env`。本项目只通过本机同源连接面板接收凭证。
+日常使用首推 Longbridge OAuth。个人本机自动化测试也可把 `LONGBRIDGE_APP_KEY`、
+`LONGBRIDGE_APP_SECRET` 和 `LONGBRIDGE_ACCESS_TOKEN` 放入已被 Git 忽略且权限为
+`600` 的 `.env`，但前端不会自动读取它们；测试脚本需显式提交到本机同源连接接口。
+任何真实凭证都不得写进 `.env.example`、`VITE_*` 变量、日志、审计账本或 Git。
 
 ## 本地 API
 
@@ -371,6 +389,11 @@ OAuth 是 Longbridge 的**提供商授权方式**，不是本项目的多用户�
 | `/api/live/volatility-context` | `GET` | 获取实时 ATM IV 与历史 RV 上下文 |
 | `/api/strategy/analyze` | `POST` | 计算多腿可执行价格与风险预览 |
 | `/api/audit/records` | `GET`, `POST` | 读取或追加脱敏哈希链记录 |
+| `/api/assistant/status` | `GET` | 查询助手启用状态，不返回密钥 |
+| `/api/assistant/sessions` | `GET`, `POST` | 列出或创建进程内对话 |
+| `/api/assistant/sessions/{id}/messages` | `POST` | 附加至多两个冻结截面并返回 SSE |
+| `/api/assistant/sessions/{id}/favorite` | `POST` | 将对话写入审计账本 |
+| `/api/assistant/sessions/import` | `POST` | 从助手收藏恢复新会话 |
 | `/api/trade/account` | `GET` | 读取模拟账户状态 |
 | `/api/trade/orders` | `GET`, `POST` | 查询或受控提交模拟订单 |
 | `/api/trade/orders/{order_id}` | `DELETE` | 请求撤销模拟订单 |

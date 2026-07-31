@@ -69,6 +69,48 @@ top-level `snapshot_id`, `as_of`, and `model_version` alongside derived panels.
 The older `/api/chain`, `/api/surface`, and `/api/volatility-context` routes
 remain available for compatibility.
 
+## Snapshot assistant
+
+The assistant is an optional, server-side OpenAI-compatible client. It has no
+trade tools and cannot call account or order routes. Sessions are held in
+process memory, capped at 30 sessions and 40 messages per session.
+
+`GET /api/assistant/status` reports provider, model, streaming support, and
+retention policy without exposing credentials. `GET` or `POST`
+`/api/assistant/sessions` lists or creates a session.
+
+`POST /api/assistant/sessions/{id}/messages` accepts:
+
+```json
+{
+  "message": "Compare volatility and dealer exposure.",
+  "context_refs": [
+    {
+      "kind": "replay",
+      "symbol": "SPY",
+      "date": "2026-07-10",
+      "minute": "10:00",
+      "expiration": "2026-07-10",
+      "pricing_mode": "micro",
+      "dealer_model": "classic",
+      "max_dte": 180
+    }
+  ],
+  "strategy": null
+}
+```
+
+`context_refs` may contain at most two `replay`, `live`, or `audit` references.
+The server resolves and freezes each reference, retains all panel metrics and
+provenance, selects at most 96 decision-relevant chain rows, downsamples the
+surface, and includes up to 90 underlying bars. The response uses Server-Sent
+Events named `meta`, `delta`, `done`, and `error`.
+
+`POST /api/assistant/sessions/{id}/favorite` writes the compact conversation to
+the hash-chain audit ledger. `POST /api/assistant/sessions/import` with
+`{"audit_record_id":"..."}` restores a favorite as a new in-memory session.
+Credential-like user messages are rejected.
+
 ## Error contract
 
 Non-2xx responses use:

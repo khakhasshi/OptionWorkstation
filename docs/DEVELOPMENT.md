@@ -73,6 +73,15 @@ Start the server, then:
 ```bash
 RUN_BROWSER_SMOKE=1 ./scripts/verify.sh http://127.0.0.1:7311
 node scripts/guide-smoke.mjs http://127.0.0.1:7311
+node scripts/assistant-browser-smoke.mjs http://127.0.0.1:7311
+```
+
+Start the Rust service with `OPTION_WORKSTATION_LLM_MOCK=1` before the assistant
+checks. To resolve a full frozen context for every replay symbol, verify
+two-context comparison, favorite it, and restore it without a trading call:
+
+```bash
+node scripts/assistant-smoke.mjs http://127.0.0.1:7311
 ```
 
 Live switching additionally requires an in-memory Longbridge paper session:

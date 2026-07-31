@@ -20,6 +20,7 @@ hex = "0.4"
 longbridge = "4.4.1"
 moka = { version = "0.12", features = ["sync"] }
 parquet = { version = "59.1", default-features = false, features = ["arrow", "snap", "zstd"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rust_decimal = "1.39"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

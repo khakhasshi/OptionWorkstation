@@ -202,11 +202,19 @@ Real-money account order submission is rejected by design.
 | `OPTION_WORKSTATION_RISK_FREE_RATE` | `0.043` | BSM risk-free rate |
 | `OPTION_WORKSTATION_FRONTEND_DIST` | `./frontend/dist` | Built static frontend |
 | `OPTION_WORKSTATION_AUDIT_PATH` | `~/.option-workstation/audit.jsonl` | Append-only research ledger |
+| `OPTION_WORKSTATION_LLM_API_KEY` | unset | Server-side OpenAI-compatible API key |
+| `OPTION_WORKSTATION_LLM_MODEL` | unset | Assistant model; both model and key are required |
+| `OPTION_WORKSTATION_LLM_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible API root |
+| `OPTION_WORKSTATION_LLM_MOCK` | unset | Local streaming integration tests only |
 | `OPTION_WORKSTATION_PAPER_ORDER_EXECUTION` | unset | Explicit paper-order server gate |
 | `RUST_LOG` | `option_workstation=info,tower_http=info` | Runtime log filter |
 
-Never place credentials in `.env`; the application accepts Longbridge
-credentials through the local same-origin connection dialog only.
+Prefer Longbridge OAuth for normal use. A personal loopback-only test may keep
+`LONGBRIDGE_APP_KEY`, `LONGBRIDGE_APP_SECRET`, and
+`LONGBRIDGE_ACCESS_TOKEN` in the ignored `.env` with mode `600`; the frontend
+does not read these variables, so test automation must explicitly submit them
+to the local same-origin connection endpoint. Never use `VITE_*` for secrets
+or commit, log, or audit a real credential.
 
 ## API Surface
 
@@ -226,6 +234,11 @@ credentials through the local same-origin connection dialog only.
 | `/api/live/volatility-context` | `GET` | Live ATM IV and adjusted-close RV context |
 | `/api/strategy/analyze` | `POST` | Multi-leg executable risk preview |
 | `/api/audit/records` | `GET`, `POST` | Read or append redacted hash-chain records |
+| `/api/assistant/status` | `GET` | Assistant availability without credential disclosure |
+| `/api/assistant/sessions` | `GET`, `POST` | List or create in-process conversations |
+| `/api/assistant/sessions/{id}/messages` | `POST` | Attach up to two frozen contexts and stream SSE |
+| `/api/assistant/sessions/{id}/favorite` | `POST` | Persist a conversation to the audit ledger |
+| `/api/assistant/sessions/import` | `POST` | Restore a new session from a favorite |
 | `/api/trade/account` | `GET` | Read paper account state |
 | `/api/trade/orders` | `GET`, `POST` | Read or guarded-submit paper orders |
 | `/api/trade/orders/{order_id}` | `DELETE` | Request paper-order cancellation |

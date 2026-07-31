@@ -1,4 +1,5 @@
 mod analytics;
+mod assistant;
 mod audit;
 mod live;
 mod models;
@@ -6,7 +7,7 @@ mod replay;
 mod strategy;
 mod volatility;
 
-use std::{env, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{convert::Infallible, env, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
@@ -15,10 +16,13 @@ use axum::{
         ws::{Message, WebSocket},
     },
     http::StatusCode,
-    response::{IntoResponse, Response},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
     routing::{get, post},
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt, stream};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tower_http::{
@@ -28,6 +32,11 @@ use tower_http::{
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
+    assistant::{
+        AssistantChatRequest, AssistantContext, AssistantContextInput, AssistantCreateRequest,
+        AssistantImportRequest, AssistantManager, AssistantSession, AssistantSnapshotRef,
+        build_context,
+    },
     audit::{AuditCaptureRequest, AuditStore},
     live::{LiveManager, option_retry_after_ms},
     models::{CredentialRequest, LiveSessionRequest, OAuthStartRequest},
@@ -40,6 +49,7 @@ struct AppState {
     replay: Arc<ReplayStore>,
     live: Arc<LiveManager>,
     audit: Arc<AuditStore>,
+    assistant: Arc<AssistantManager>,
 }
 
 #[derive(Debug)]
@@ -183,6 +193,7 @@ fn validate_minute(value: &str) -> Result<(), ApiError> {
 
 async fn health(State(state): State<AppState>) -> Json<Value> {
     let connection = state.live.status().await;
+    let assistant = state.assistant.status();
     Json(json!({
         "ok": state.replay.root().is_dir(),
         "engine": "rust",
@@ -191,6 +202,8 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
         "data_root": state.replay.root(),
         "audit_ledger": state.audit.path(),
         "live_connected": connection.connected,
+        "assistant_enabled": assistant.enabled,
+        "assistant_model": assistant.model,
     }))
 }
 
@@ -465,6 +478,272 @@ async fn append_audit_record(
         .map_err(ApiError::bad_request)
 }
 
+async fn assistant_status(State(state): State<AppState>) -> Json<Value> {
+    Json(serde_json::to_value(state.assistant.status()).expect("serialize assistant status"))
+}
+
+async fn assistant_sessions(State(state): State<AppState>) -> Json<Value> {
+    Json(
+        serde_json::to_value(state.assistant.list_sessions().await)
+            .expect("serialize assistant sessions"),
+    )
+}
+
+async fn create_assistant_session(
+    State(state): State<AppState>,
+    Json(request): Json<AssistantCreateRequest>,
+) -> Json<Value> {
+    Json(
+        serde_json::to_value(state.assistant.create_session(request).await)
+            .expect("serialize assistant session"),
+    )
+}
+
+async fn get_assistant_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    state
+        .assistant
+        .get_session(&id)
+        .await
+        .and_then(|session| serde_json::to_value(session).map_err(anyhow::Error::from))
+        .map(Json)
+        .map_err(ApiError::bad_request)
+}
+
+async fn delete_assistant_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    if state.assistant.delete_session(&id).await {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::bad_request("assistant session not found"))
+    }
+}
+
+async fn resolve_assistant_context(
+    state: &AppState,
+    reference: AssistantSnapshotRef,
+    strategy: Option<Value>,
+) -> Result<AssistantContext, ApiError> {
+    match reference {
+        AssistantSnapshotRef::Replay {
+            symbol,
+            date,
+            minute,
+            expiration,
+            pricing_mode,
+            dealer_model,
+            max_dte,
+        } => {
+            validate_minute(&minute)?;
+            if !(1..=1000).contains(&max_dte) {
+                return Err(ApiError::bad_request("max_dte must be between 1 and 1000"));
+            }
+            let snapshot = state
+                .replay
+                .snapshot(ReplaySnapshotParams {
+                    symbol: &symbol,
+                    trading_date: &date,
+                    minute: &minute,
+                    expiration: &expiration,
+                    pricing_mode: &pricing_mode,
+                    dealer_model: &dealer_model,
+                    max_dte,
+                })
+                .map_err(ApiError::bad_request)?;
+            let session = state
+                .replay
+                .session(&snapshot.symbol, &snapshot.date)
+                .map_err(ApiError::bad_request)?;
+            let bars = session["series"][&snapshot.symbol]["bars"].clone();
+            let label = format!(
+                "{} {} {} ET",
+                snapshot.symbol, snapshot.date, snapshot.minute
+            );
+            let symbol = snapshot.symbol.clone();
+            let snapshot_id = snapshot.snapshot_id.clone();
+            let as_of = snapshot.as_of.clone();
+            let model_version = Some(snapshot.model_version.clone());
+            let payload = serde_json::to_value(snapshot).map_err(ApiError::bad_request)?;
+            Ok(build_context(AssistantContextInput {
+                label,
+                mode: "replay".into(),
+                symbol,
+                snapshot_id,
+                as_of,
+                model_version,
+                payload,
+                market_bars: Some(bars),
+                strategy,
+            }))
+        }
+        AssistantSnapshotRef::Live => {
+            let snapshot = state.live.snapshot().await.map_err(ApiError::conflict)?;
+            let closes = state
+                .live
+                .daily_closes(45)
+                .await
+                .map_err(ApiError::upstream)?;
+            let volatility = state
+                .replay
+                .live_volatility_context(&snapshot.chain, &closes)
+                .map_err(ApiError::bad_request)?;
+            let label = format!("{} LIVE {}", snapshot.chain.symbol, snapshot.chain.minute);
+            let symbol = snapshot.chain.symbol.clone();
+            let snapshot_id = snapshot.chain.snapshot_id.clone();
+            let as_of = snapshot.feed.as_of.clone();
+            let model_version = Some(snapshot.chain.provenance.model.clone());
+            let bars = serde_json::to_value(&snapshot.bars).map_err(ApiError::bad_request)?;
+            let mut payload = serde_json::to_value(snapshot).map_err(ApiError::bad_request)?;
+            payload["volatility"] = volatility;
+            Ok(build_context(AssistantContextInput {
+                label,
+                mode: "live".into(),
+                symbol,
+                snapshot_id,
+                as_of,
+                model_version,
+                payload,
+                market_bars: Some(bars),
+                strategy,
+            }))
+        }
+        AssistantSnapshotRef::Audit { record_id } => {
+            let record = state
+                .audit
+                .get(&record_id)
+                .await
+                .map_err(ApiError::bad_request)?;
+            if record.kind == "assistant_analysis" {
+                return Err(ApiError::bad_request(
+                    "收藏的助手分析请使用导入会话，不可作为市场截面",
+                ));
+            }
+            let root = record.payload.get("snapshot").unwrap_or(&record.payload);
+            let chain = root.get("chain").or_else(|| record.payload.get("chain"));
+            let snapshot_id = record
+                .snapshot_id
+                .clone()
+                .or_else(|| chain.and_then(|value| value["snapshot_id"].as_str().map(String::from)))
+                .unwrap_or_else(|| format!("audit:{}", record.id));
+            let as_of = chain
+                .and_then(|value| {
+                    value["timestamp"]
+                        .as_str()
+                        .or_else(|| value["as_of"].as_str())
+                })
+                .unwrap_or(&record.created_at)
+                .to_string();
+            let model_version = chain
+                .and_then(|value| value["provenance"]["model"].as_str())
+                .map(String::from);
+            let bars = root
+                .get("bars")
+                .or_else(|| root.get("market_bars"))
+                .cloned();
+            Ok(build_context(AssistantContextInput {
+                label: format!("收藏截面 {} · {}", record.symbol, &record.id[..8]),
+                mode: record.mode,
+                symbol: record.symbol,
+                snapshot_id,
+                as_of,
+                model_version,
+                payload: record.payload,
+                market_bars: bars,
+                strategy,
+            }))
+        }
+    }
+}
+
+async fn assistant_chat(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<AssistantChatRequest>,
+) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    if request.context_refs.len() > 2 {
+        return Err(ApiError::bad_request("最多附加两个截面"));
+    }
+    let mut contexts = Vec::with_capacity(request.context_refs.len());
+    for reference in request.context_refs {
+        contexts
+            .push(resolve_assistant_context(&state, reference, request.strategy.clone()).await?);
+    }
+    let receiver = state
+        .assistant
+        .stream_chat(id, request.message, contexts)
+        .await
+        .map_err(ApiError::bad_request)?;
+    let events = stream::unfold(receiver, |mut receiver| async move {
+        receiver.recv().await.map(|event| {
+            let item = Event::default()
+                .event(event.event_name())
+                .json_data(event)
+                .unwrap_or_else(|_| Event::default().event("error").data("serialization error"));
+            (Ok(item), receiver)
+        })
+    });
+    Ok(Sse::new(events).keep_alive(KeepAlive::default()))
+}
+
+async fn favorite_assistant_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let session = state
+        .assistant
+        .get_session(&id)
+        .await
+        .map_err(ApiError::bad_request)?;
+    if session.messages.is_empty() {
+        return Err(ApiError::bad_request("空会话不能收藏"));
+    }
+    let context = session.contexts.first();
+    state
+        .audit
+        .append(AuditCaptureRequest {
+            kind: "assistant_analysis".into(),
+            mode: context
+                .map(|item| item.mode.clone())
+                .unwrap_or_else(|| "research".into()),
+            symbol: context
+                .map(|item| item.symbol.clone())
+                .unwrap_or_else(|| "ASSISTANT".into()),
+            snapshot_id: context.map(|item| item.snapshot_id.clone()),
+            payload: json!({
+                "session": session,
+                "assistant": state.assistant.status(),
+            }),
+        })
+        .await
+        .and_then(|record| serde_json::to_value(record).map_err(anyhow::Error::from))
+        .map(Json)
+        .map_err(ApiError::bad_request)
+}
+
+async fn import_assistant_session(
+    State(state): State<AppState>,
+    Json(request): Json<AssistantImportRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let record = state
+        .audit
+        .get(&request.audit_record_id)
+        .await
+        .map_err(ApiError::bad_request)?;
+    if record.kind != "assistant_analysis" {
+        return Err(ApiError::bad_request("该审计记录不是助手收藏"));
+    }
+    let session: AssistantSession =
+        serde_json::from_value(record.payload["session"].clone()).map_err(ApiError::bad_request)?;
+    let imported = state.assistant.import_session(session, record.id).await;
+    serde_json::to_value(imported)
+        .map(Json)
+        .map_err(ApiError::bad_request)
+}
+
 async fn trade_account(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     state
         .live
@@ -640,6 +919,27 @@ fn app(state: AppState, frontend_dist: PathBuf) -> Router {
             get(audit_records).post(append_audit_record),
         )
         .route("/api/audit/records/{id}", get(audit_record))
+        .route("/api/assistant/status", get(assistant_status))
+        .route(
+            "/api/assistant/sessions",
+            get(assistant_sessions).post(create_assistant_session),
+        )
+        .route(
+            "/api/assistant/sessions/import",
+            post(import_assistant_session),
+        )
+        .route(
+            "/api/assistant/sessions/{id}",
+            get(get_assistant_session).delete(delete_assistant_session),
+        )
+        .route(
+            "/api/assistant/sessions/{id}/messages",
+            post(assistant_chat),
+        )
+        .route(
+            "/api/assistant/sessions/{id}/favorite",
+            post(favorite_assistant_session),
+        )
         .route("/api/trade/account", get(trade_account))
         .route(
             "/api/trade/orders",
@@ -697,6 +997,7 @@ async fn main() -> anyhow::Result<()> {
         replay: Arc::new(ReplayStore::new(data_root, risk_free_rate)),
         live,
         audit: Arc::new(AuditStore::new(audit_path)),
+        assistant: Arc::new(AssistantManager::new()),
     };
     let address: SocketAddr = format!("{host}:{port}").parse()?;
     let listener = tokio::net::TcpListener::bind(address).await?;

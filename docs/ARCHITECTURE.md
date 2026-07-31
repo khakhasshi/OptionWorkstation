@@ -51,7 +51,9 @@ flowchart TB
 `frontend/` is a React 19 and Vite application. It renders the underlying tape,
 chain, smile, SVI diagnostics, term structure, dealer exposure, constrained
 surface, strategy builder, risk matrix, audit records, and account/order
-monitor.
+monitor. The snapshot assistant is a lazy-loaded floating module; it sends only
+server-resolvable context references and user text, not browser-assembled raw
+chains.
 
 The browser receives normalized JSON snapshots. It does not parse Parquet,
 calculate authoritative analytics, or own execution gates.
@@ -67,6 +69,8 @@ calculate authoritative analytics, or own execution gates.
 - `analytics.rs`: chain construction, IV/Greeks, quality, SVI, and exposure;
 - `volatility.rs`: IV history, realized volatility, VRP, and expected move;
 - `strategy.rs`: executable multi-leg risk and order-plan validation;
+- `assistant.rs`: bounded context compaction, in-memory conversations, and
+  OpenAI-compatible SSE streaming without trade tools;
 - `audit.rs`: credential-rejecting append-only hash-chain records;
 - `models.rs`: transport and domain structures.
 
