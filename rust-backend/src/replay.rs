@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 
 use crate::{
     analytics::{ChainBuild, build_chain, build_surface},
-    models::{Bar, ChainSnapshot, RawOptionQuote, SurfaceSnapshot},
+    models::{Bar, ChainSnapshot, RawOptionQuote, ReplaySnapshot, SurfaceSnapshot},
     volatility::{IvHistoryPoint, VolatilityInput, build_context},
 };
 
@@ -31,6 +31,16 @@ pub struct ReplayStore {
     stock_cache: Cache<String, Arc<Vec<Bar>>>,
     quote_cache: Cache<String, Arc<Vec<RawOptionQuote>>>,
     oi_cache: Cache<String, Arc<OiMap>>,
+}
+
+pub struct ReplaySnapshotParams<'a> {
+    pub symbol: &'a str,
+    pub trading_date: &'a str,
+    pub minute: &'a str,
+    pub expiration: &'a str,
+    pub pricing_mode: &'a str,
+    pub dealer_model: &'a str,
+    pub max_dte: i64,
 }
 
 impl ReplayStore {
@@ -368,6 +378,43 @@ impl ReplayStore {
             rv_source: "ThetaData adjusted underlying closes".into(),
         }))
         .map_err(anyhow::Error::from)
+    }
+
+    pub fn snapshot(&self, params: ReplaySnapshotParams<'_>) -> anyhow::Result<ReplaySnapshot> {
+        let chain = self.chain(
+            params.symbol,
+            params.trading_date,
+            params.minute,
+            params.expiration,
+            params.pricing_mode,
+            params.dealer_model,
+        )?;
+        let surface = self.surface(
+            params.symbol,
+            params.trading_date,
+            params.minute,
+            params.max_dte,
+        )?;
+        let volatility = self.volatility_context(
+            params.symbol,
+            params.trading_date,
+            params.minute,
+            params.expiration,
+        )?;
+        let snapshot_id = format!("replay:{}", chain.snapshot_id);
+        Ok(ReplaySnapshot {
+            kind: "replay_snapshot",
+            snapshot_id,
+            symbol: chain.symbol.clone(),
+            date: chain.date.clone(),
+            minute: chain.minute.clone(),
+            expiration: chain.expiration.clone(),
+            as_of: chain.timestamp.clone(),
+            model_version: chain.provenance.model.clone(),
+            chain,
+            surface,
+            volatility,
+        })
     }
 
     pub fn live_volatility_context(

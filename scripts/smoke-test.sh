@@ -22,6 +22,9 @@ jq -e '(.grid | length > 0) and (.arbitrage.confidence_score >= 0) and .arbitrag
 VOLATILITY="$(curl -fsS "$BASE_URL/api/volatility-context?symbol=SPY&date=$DATE&minute=$MINUTE&expiration=$EXPIRATION")"
 jq -e '(.history | length > 0) and .expected_move_basis and .iv_source and .rv_source' <<<"$VOLATILITY" >/dev/null
 
+SNAPSHOT="$(curl -fsS "$BASE_URL/api/v1/replay/snapshot?symbol=SPY&date=$DATE&minute=$MINUTE&expiration=$EXPIRATION&pricing_mode=micro&dealer_model=classic&max_dte=180")"
+jq -e '.kind == "replay_snapshot" and .snapshot_id and .as_of and .model_version and (.chain.rows | length > 0) and (.surface.grid | length > 0) and .volatility.expected_move_basis' <<<"$SNAPSHOT" >/dev/null
+
 LEG="$(jq -c '.rows | map(select(.bid > 0 and .ask >= .bid and .quality_score >= 50))[0] | {symbol, strike, right, side:"BUY", ratio:1}' <<<"$CHAIN")"
 STRATEGY_REQUEST="$(jq -nc --arg date "$DATE" --arg minute "$MINUTE" --arg expiration "$EXPIRATION" --argjson leg "$LEG" '{mode:"replay",symbol:"SPY",date:$date,minute:$minute,expiration:$expiration,pricing_mode:"micro",dealer_model:"classic",quantity:1,legs:[$leg]}')"
 curl -fsS -X POST "$BASE_URL/api/strategy/analyze" -H 'Content-Type: application/json' --data-binary "$STRATEGY_REQUEST" | jq -e '.preview_id and (.payoff | length > 100) and (.scenarios | length == 45) and .pricing_basis' >/dev/null

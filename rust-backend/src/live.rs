@@ -474,6 +474,7 @@ impl LiveManager {
         {
             let mut state = self.state.write().await;
             state.status.state = "connecting".into();
+            state.status.switch_state = "connecting".into();
             state.status.error = None;
         }
         let config = Arc::new(Config::from_apikey(
@@ -505,6 +506,7 @@ impl LiveManager {
                 let mut state = self.state.write().await;
                 state.status.connected = false;
                 state.status.state = "error".into();
+                state.status.switch_state = "error".into();
                 state.status.error = Some(error.to_string());
                 return Err(error);
             }
@@ -573,6 +575,13 @@ impl LiveManager {
             packages,
             subscribed_contracts: 0,
             last_event_at: None,
+            last_snapshot_at: None,
+            last_snapshot_sequence: None,
+            latency_ms: None,
+            stale_after_ms: 5_000,
+            reconnect_count: 0,
+            active_symbol: None,
+            switch_state: "idle".into(),
             error: None,
             credential_storage: "process_memory_only",
             trade_connected,
@@ -856,6 +865,8 @@ impl LiveManager {
             let mut state = self.state.write().await;
             state.status.subscribed_contracts = active.contracts.len();
             state.status.state = "streaming".into();
+            state.status.active_symbol = Some(active.display_symbol.clone());
+            state.status.switch_state = "ready".into();
             state.status.error = None;
             state.active = Some(active);
         }
@@ -939,6 +950,15 @@ impl LiveManager {
             return Ok(snapshot.clone());
         }
         let snapshot = self.build_snapshot(sequence).await?;
+        {
+            let mut state = self.state.write().await;
+            state.status.last_snapshot_at = Some(snapshot.chain.timestamp.clone());
+            state.status.last_snapshot_sequence = Some(sequence);
+            state.status.latency_ms = Some(snapshot.feed.latency_ms);
+            state.status.stale_after_ms = snapshot.feed.stale_after_ms;
+            state.status.active_symbol = Some(snapshot.feed.symbol.clone());
+            state.status.switch_state = "ready".into();
+        }
         *cache = Some((sequence, snapshot.clone()));
         Ok(snapshot)
     }

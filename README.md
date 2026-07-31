@@ -17,7 +17,7 @@
 
 [English](README.en.md) · [新手指南](frontend/public/guide.html) ·
 [系统架构](docs/ARCHITECTURE.md) · [数据规范](docs/DATA_SOURCES.md) ·
-[示例数据](docs/EXAMPLE_DATA.md) · [安全策略](SECURITY.md)
+[示例数据](docs/EXAMPLE_DATA.md) · [API 合约](docs/API.md) · [安全策略](SECURITY.md)
 
 维护者：[JIANGJINGZHE（江景哲）](mailto:jiangjingzhe2004@gmail.com) ·
 [WhatsApp](https://wa.me/85268515553)
@@ -39,6 +39,8 @@ Option Workstation 刻意把这些层次拆开并显示出来：
 - Bid/Ask 可用性、报价年龄和 OI 元数据覆盖率不会被隐藏；
 - BSM、SVI、Greeks、GEX、波动率上下文和曲面由 Rust 服务统一计算；
 - 组合分析按可执行 NBBO 边计价，而不是只展示理想化中间价；
+- 历史回放通过统一 point-in-time snapshot 同步期权链、曲面和波动率上下文；
+- 研究工作区可以保存标的、时刻、到期日、布局和策略腿，方便重复验证；
 - 关键截面可以写入追加式 JSONL 哈希链，便于复盘与追责；
 - 模拟下单由多个彼此独立的服务端门禁保护。
 

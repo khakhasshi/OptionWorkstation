@@ -14,5 +14,14 @@ export default defineConfig({
   build: {
     outDir: 'dist',
     sourcemap: true,
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          react: ['react', 'react-dom'],
+          echarts: ['echarts'],
+          'echarts-gl': ['echarts-gl'],
+        },
+      },
+    },
   },
 })

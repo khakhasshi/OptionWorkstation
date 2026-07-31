@@ -51,6 +51,9 @@ pub struct ExecutionLeg {
     pub limit_price: f64,
     pub bid: f64,
     pub ask: f64,
+    pub spread: f64,
+    pub spread_pct: f64,
+    pub quote_quality: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -81,6 +84,9 @@ pub struct StrategyAnalysis {
     pub entry_cash_flow: f64,
     pub liquidation_value: f64,
     pub immediate_pnl: f64,
+    pub entry_spread_cost: f64,
+    pub max_leg_spread_pct: f64,
+    pub min_quote_quality: f64,
     pub max_profit: Option<f64>,
     pub max_loss: Option<f64>,
     pub margin_estimate: Option<f64>,
@@ -93,6 +99,7 @@ pub struct StrategyAnalysis {
     pub executable: bool,
     pub blockers: Vec<String>,
     pub pricing_basis: String,
+    pub execution_mode: String,
 }
 
 struct ResolvedLeg<'a> {
@@ -186,6 +193,18 @@ pub fn analyze_strategy(
             leg.sign * leg.contracts * price * 100.0
         })
         .sum::<f64>();
+    let entry_spread_cost = resolved
+        .iter()
+        .map(|leg| leg.contracts * (leg.row.ask - leg.row.bid).max(0.0) * 100.0)
+        .sum::<f64>();
+    let max_leg_spread_pct = resolved
+        .iter()
+        .map(|leg| leg.row.spread_pct)
+        .fold(0.0, f64::max);
+    let min_quote_quality = resolved
+        .iter()
+        .map(|leg| leg.row.quality_score)
+        .fold(100.0, f64::min);
     let payoff_at = |spot: f64| -> f64 {
         entry_cash_flow
             + resolved
@@ -285,6 +304,9 @@ pub fn analyze_strategy(
             ),
             bid: leg.row.bid,
             ask: leg.row.ask,
+            spread: leg.row.spread,
+            spread_pct: leg.row.spread_pct,
+            quote_quality: leg.row.quality_score,
         })
         .collect();
     let mut blockers = Vec::new();
@@ -313,6 +335,12 @@ pub fn analyze_strategy(
         if leg.row.quality_score < 50.0 {
             blockers.push(format!("low quote quality for {}", leg.row.symbol));
         }
+        if leg.row.spread_pct > 25.0 {
+            blockers.push(format!(
+                "wide bid/ask spread {:.1}% for {}",
+                leg.row.spread_pct, leg.row.symbol
+            ));
+        }
     }
     blockers.sort();
     blockers.dedup();
@@ -332,6 +360,9 @@ pub fn analyze_strategy(
         entry_cash_flow: round(entry_cash_flow, 2),
         liquidation_value: round(liquidation_value, 2),
         immediate_pnl: round(entry_cash_flow + liquidation_value, 2),
+        entry_spread_cost: round(entry_spread_cost, 2),
+        max_leg_spread_pct: round(max_leg_spread_pct, 2),
+        min_quote_quality: round(min_quote_quality, 2),
         max_profit: max_profit.map(|value| round(value, 2)),
         max_loss: max_loss.map(|value| round(value, 2)),
         margin_estimate: margin_estimate.map(|value| round(value, 2)),
@@ -344,6 +375,7 @@ pub fn analyze_strategy(
         executable: blockers.is_empty(),
         blockers,
         pricing_basis: "entry BUY@ask / SELL@bid; liquidation BUY@ask / SELL@bid".into(),
+        execution_mode: "paper_sequential_guarded; complex_order_atomicity=false".into(),
     })
 }
 
