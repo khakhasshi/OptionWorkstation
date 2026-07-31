@@ -271,6 +271,17 @@ tr.focused { background: #18272e; }
 .assistant-message.user > span { border-color: #396f64; color: #67d4b9; }
 .assistant-message > div { min-width: 0; padding: 5px 7px; border-left: 2px solid #2d3a43; background: #10181e; color: #aebbc4; font-size: 9px; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
 .assistant-message.user > div { border-left-color: #3d8978; background: #101d1b; color: #c4d3d0; }
+.assistant-message.error > span { border-color: #704049; color: #ff8f9b; }
+.assistant-message.error > div { border-left-color: #704049; background: #211417; color: #ff9aa4; }
+.assistant-message h4 { margin: 7px 0 3px; color: #d7e2e8; font-size: 10px; }
+.assistant-message h4:first-child { margin-top: 0; }
+.assistant-message p { margin: 0 0 3px; }
+.assistant-message p:last-child { margin-bottom: 0; }
+.assistant-message strong { color: #d9e4ea; font-weight: 700; }
+.assistant-message hr { margin: 7px 0; border: 0; border-top: 1px solid #2a3740; }
+.assistant-message .assistant-bullet { position: relative; padding-left: 10px; }
+.assistant-message .assistant-bullet::before { content: ""; position: absolute; left: 1px; top: .7em; width: 3px; height: 3px; background: #54d6b6; }
+.assistant-break { display: block; height: 5px; }
 .assistant-composer { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) 39px; border-top: 1px solid #29353e; background: #10181e; }
 .assistant-composer textarea { width: 100%; height: 61px; min-width: 0; padding: 8px 9px; border: 0; outline: 0; resize: none; background: transparent; color: #d3dde4; font-size: 10px; line-height: 1.45; }
 .assistant-composer textarea::placeholder { color: #596974; }

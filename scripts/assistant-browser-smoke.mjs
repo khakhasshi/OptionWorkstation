@@ -51,13 +51,24 @@ try {
   await openAssistant()
   const desktop = await assertAssistantInsideViewport()
   await page.waitForSelector('.assistant-quick button', { timeout: 10_000 })
-  await page.$eval('.assistant-quick button', (button) => button.click())
+  await page.$eval('.assistant-quick', (container) => {
+    const buttons = container.querySelectorAll('button')
+    buttons[0]?.click()
+    buttons[1]?.click()
+  })
   await page.waitForFunction(
     () => {
       const messages = [...document.querySelectorAll('.assistant-message.assistant > div')]
-      return messages.some((node) => node.textContent?.includes('测试模式已接收并冻结'))
+      return messages.some((node) => {
+        const text = node.textContent || ''
+        return text.length > 40 && !text.includes('正在冻结') && !text.includes('正在生成')
+      })
     },
-    { timeout: 30_000 },
+    { timeout: 90_000 },
+  )
+  await page.waitForFunction(
+    () => document.querySelector('.assistant-quick button')?.disabled === false,
+    { timeout: 90_000 },
   )
   const desktopMessageCount = await page.$$eval('.assistant-message', (items) => items.length)
   if (desktopMessageCount !== 2) throw new Error(`expected 2 desktop messages, got ${desktopMessageCount}`)

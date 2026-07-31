@@ -12,7 +12,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc};
 
 const MAX_SESSIONS: usize = 30;
 const MAX_MESSAGES: usize = 40;
@@ -211,6 +211,7 @@ pub struct AssistantManager {
     config: AssistantConfig,
     client: Client,
     sessions: RwLock<HashMap<String, AssistantSession>>,
+    active_sessions: Mutex<HashSet<String>>,
     sequence: AtomicU64,
 }
 
@@ -223,6 +224,7 @@ impl AssistantManager {
                 .build()
                 .expect("build LLM HTTP client"),
             sessions: RwLock::new(HashMap::new()),
+            active_sessions: Mutex::new(HashSet::new()),
             sequence: AtomicU64::new(0),
         }
     }
@@ -326,6 +328,9 @@ impl AssistantManager {
     }
 
     pub async fn delete_session(&self, id: &str) -> bool {
+        if self.active_sessions.lock().await.contains(id) {
+            return false;
+        }
         self.sessions.write().await.remove(id).is_some()
     }
 
@@ -341,16 +346,26 @@ impl AssistantManager {
         );
         validate_user_message(&message)?;
         anyhow::ensure!(contexts.len() <= MAX_CONTEXTS, "最多附加两个截面");
+        anyhow::ensure!(
+            self.active_sessions.lock().await.insert(session_id.clone()),
+            "当前会话正在生成回答，请等待完成"
+        );
 
         let session = {
             let mut sessions = self.sessions.write().await;
-            let session = sessions
-                .get_mut(&session_id)
-                .ok_or_else(|| anyhow!("assistant session not found"))?;
+            let Some(session) = sessions.get_mut(&session_id) else {
+                drop(sessions);
+                self.active_sessions.lock().await.remove(&session_id);
+                return Err(anyhow!("assistant session not found"));
+            };
             if !contexts.is_empty() {
                 session.contexts = deduplicate_contexts(contexts);
             }
-            anyhow::ensure!(!session.contexts.is_empty(), "请先附加一个市场截面");
+            if session.contexts.is_empty() {
+                drop(sessions);
+                self.active_sessions.lock().await.remove(&session_id);
+                return Err(anyhow!("请先附加一个市场截面"));
+            }
             let now = Utc::now().to_rfc3339();
             let user_message = AssistantMessage {
                 id: self.next_id("message"),
@@ -405,18 +420,33 @@ impl AssistantManager {
                     };
                     if let Some(stored) = manager.sessions.write().await.get_mut(&session_id) {
                         stored.messages.push(message.clone());
+                        trim_messages(stored);
                         stored.updated_at = message.created_at.clone();
                     }
                     let _ = sender.send(AssistantStreamEvent::Done { message }).await;
                 }
                 Err(error) => {
-                    let _ = sender
-                        .send(AssistantStreamEvent::Error {
-                            detail: format!("{error:#}"),
-                        })
-                        .await;
+                    let detail = format!("{error:#}");
+                    let message = AssistantMessage {
+                        id: manager.next_id("message"),
+                        role: "error".into(),
+                        content: format!("请求失败：{detail}"),
+                        created_at: Utc::now().to_rfc3339(),
+                        context_ids: session
+                            .contexts
+                            .iter()
+                            .map(|context| context.id.clone())
+                            .collect(),
+                    };
+                    if let Some(stored) = manager.sessions.write().await.get_mut(&session_id) {
+                        stored.messages.push(message);
+                        trim_messages(stored);
+                        stored.updated_at = Utc::now().to_rfc3339();
+                    }
+                    let _ = sender.send(AssistantStreamEvent::Error { detail }).await;
                 }
             }
+            manager.active_sessions.lock().await.remove(&session_id);
         });
         Ok(receiver)
     }
@@ -464,16 +494,12 @@ impl AssistantManager {
             .as_deref()
             .ok_or_else(|| anyhow!("LLM API key is unavailable"))?;
         let messages = provider_messages(session)?;
+        let request_body = provider_request_body(&self.config, messages);
         let response = self
             .client
             .post(format!("{}/chat/completions", self.config.base_url))
             .bearer_auth(api_key)
-            .json(&json!({
-                "model": self.config.model,
-                "messages": messages,
-                "temperature": 0.2,
-                "stream": true,
-            }))
+            .json(&request_body)
             .send()
             .await
             .context("request OpenAI-compatible LLM")?;
@@ -821,12 +847,18 @@ fn provider_messages(session: &AssistantSession) -> anyhow::Result<Vec<Value>> {
             )
         }),
     ];
-    messages.extend(session.messages.iter().map(|message| {
-        json!({
-            "role": message.role,
-            "content": message.content,
-        })
-    }));
+    messages.extend(
+        session
+            .messages
+            .iter()
+            .filter(|message| matches!(message.role.as_str(), "user" | "assistant"))
+            .map(|message| {
+                json!({
+                    "role": message.role,
+                    "content": message.content,
+                })
+            }),
+    );
     Ok(messages)
 }
 
@@ -862,6 +894,26 @@ fn deduplicate_contexts(contexts: Vec<AssistantContext>) -> Vec<AssistantContext
         .collect()
 }
 
+fn trim_messages(session: &mut AssistantSession) {
+    if session.messages.len() > MAX_MESSAGES {
+        let excess = session.messages.len() - MAX_MESSAGES;
+        session.messages.drain(0..excess);
+    }
+}
+
+fn provider_request_body(config: &AssistantConfig, messages: Vec<Value>) -> Value {
+    let mut body = json!({
+        "model": config.model,
+        "messages": messages,
+        "temperature": 0.2,
+        "stream": true,
+    });
+    if config.base_url.contains("deepseek") || config.model.starts_with("deepseek") {
+        body["thinking"] = json!({"type": "disabled"});
+    }
+    body
+}
+
 fn default_pricing_mode() -> String {
     "micro".into()
 }
@@ -892,6 +944,7 @@ mod tests {
             },
             client: Client::new(),
             sessions: RwLock::new(HashMap::new()),
+            active_sessions: Mutex::new(HashSet::new()),
             sequence: AtomicU64::new(0),
         }
     }
@@ -950,6 +1003,15 @@ mod tests {
         assert!(validate_user_message("hk_m_example-token").is_err());
     }
 
+    #[test]
+    fn deepseek_requests_disable_reasoning_mode() {
+        let mut manager = mock_manager();
+        manager.config.base_url = "https://api.deepseek.com".into();
+        manager.config.model = "deepseek-v4-flash".into();
+        let body = provider_request_body(&manager.config, vec![]);
+        assert_eq!(body["thinking"]["type"], "disabled");
+    }
+
     #[tokio::test]
     async fn mock_provider_streams_and_persists_a_reply() {
         let manager = Arc::new(mock_manager());
@@ -980,6 +1042,35 @@ mod tests {
                 .messages
                 .len(),
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn active_session_rejects_duplicate_turn_without_mutating_history() {
+        let manager = Arc::new(mock_manager());
+        let session = manager
+            .create_session(AssistantCreateRequest { title: None })
+            .await;
+        manager
+            .active_sessions
+            .lock()
+            .await
+            .insert(session.id.clone());
+        let result = manager
+            .stream_chat(
+                session.id.clone(),
+                "重复请求".into(),
+                vec![sample_context()],
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(
+            manager
+                .get_session(&session.id)
+                .await
+                .unwrap()
+                .messages
+                .is_empty()
         );
     }
 }

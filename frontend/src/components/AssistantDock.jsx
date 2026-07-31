@@ -26,6 +26,27 @@ function recordLabel(record) {
   return `${record.symbol} · ${time} · ${record.kind}`
 }
 
+function renderInline(text) {
+  return text.split(/(\*\*[^*]+\*\*)/g).map((part, index) => (
+    part.startsWith('**') && part.endsWith('**')
+      ? <strong key={`${part}-${index}`}>{part.slice(2, -2)}</strong>
+      : part
+  ))
+}
+
+function MessageContent({ content, status }) {
+  const text = content || status || ''
+  return <div>{text.split('\n').map((line, index) => {
+    const heading = line.match(/^#{1,3}\s+(.+)/)
+    if (heading) return <h4 key={`${line}-${index}`}>{renderInline(heading[1])}</h4>
+    if (/^-{3,}$/.test(line.trim())) return <hr key={`rule-${index}`} />
+    const bullet = line.match(/^[-*]\s+(.+)/)
+    if (bullet) return <p className="assistant-bullet" key={`${line}-${index}`}>{renderInline(bullet[1])}</p>
+    if (!line.trim()) return <span className="assistant-break" key={`break-${index}`} />
+    return <p key={`${line}-${index}`}>{renderInline(line)}</p>
+  })}</div>
+}
+
 export default function AssistantDock({
   currentSnapshotRef,
   currentSnapshotLabel,
@@ -51,6 +72,8 @@ export default function AssistantDock({
   const pendingDeltaRef = useRef('')
   const flushTimerRef = useRef(null)
   const abortRef = useRef(null)
+  const streamingRef = useRef(false)
+  const waitTimersRef = useRef([])
 
   const snapshotRecords = useMemo(
     () => auditRecords.filter((record) => record.kind !== 'assistant_analysis'),
@@ -113,6 +136,7 @@ export default function AssistantDock({
       active = false
       abortRef.current?.abort()
       if (flushTimerRef.current) window.clearTimeout(flushTimerRef.current)
+      waitTimersRef.current.forEach((timer) => window.clearTimeout(timer))
     }
   }, [createSession, onError, openSession, refreshSessions])
 
@@ -129,41 +153,66 @@ export default function AssistantDock({
       const next = [...current]
       const index = next.findLastIndex((item) => item.role === 'assistant' && item.streaming)
       if (index < 0) return next
-      next[index] = { ...next[index], content: `${next[index].content}${delta}` }
+      next[index] = {
+        ...next[index],
+        content: `${next[index].content}${delta}`,
+        status: null,
+      }
       return next
     })
   }, [])
 
   const sendMessage = useCallback(async (requestedPrompt) => {
     const content = (requestedPrompt ?? prompt).trim()
-    if (!content || streaming) return
+    if (!content || streamingRef.current) return
     if (!contextRefs.length) {
       onError('请先附加当前截面或一个收藏截面')
       return
     }
-    let activeSession = session
-    if (!activeSession) activeSession = await createSession()
-    const localUser = {
-      id: `local-user-${Date.now()}`,
-      role: 'user',
-      content,
-      created_at: new Date().toISOString(),
-    }
-    const localAssistant = {
-      id: `local-assistant-${Date.now()}`,
-      role: 'assistant',
-      content: '',
-      created_at: new Date().toISOString(),
-      streaming: true,
-    }
-    setMessages((current) => [...current, localUser, localAssistant])
-    setPrompt('')
-    setSaved(false)
+    streamingRef.current = true
     setStreaming(true)
-    pendingDeltaRef.current = ''
-    const controller = new AbortController()
-    abortRef.current = controller
+    let localAssistantId = ''
+    let timedOut = false
     try {
+      let activeSession = session
+      if (!activeSession) activeSession = await createSession()
+      const now = Date.now()
+      localAssistantId = `local-assistant-${now}`
+      const localUser = {
+        id: `local-user-${now}`,
+        role: 'user',
+        content,
+        created_at: new Date().toISOString(),
+      }
+      const localAssistant = {
+        id: localAssistantId,
+        role: 'assistant',
+        content: '',
+        status: '正在冻结并读取截面…',
+        created_at: new Date().toISOString(),
+        streaming: true,
+      }
+      setMessages((current) => [...current, localUser, localAssistant])
+      setPrompt('')
+      setSaved(false)
+      pendingDeltaRef.current = ''
+      const updateStatus = (statusText) => {
+        setMessages((current) => current.map((item) => (
+          item.id === localAssistantId && item.streaming && !item.content
+            ? { ...item, status: statusText }
+            : item
+        )))
+      }
+      waitTimersRef.current = [
+        window.setTimeout(() => updateStatus('模型正在生成答案…'), 8_000),
+        window.setTimeout(() => updateStatus('模型响应较慢，仍在等待…'), 30_000),
+      ]
+      const controller = new AbortController()
+      abortRef.current = controller
+      waitTimersRef.current.push(window.setTimeout(() => {
+        timedOut = true
+        controller.abort()
+      }, 90_000))
       await apiEventStream(
         `/api/assistant/sessions/${activeSession.id}/messages`,
         {
@@ -187,13 +236,25 @@ export default function AssistantDock({
       await refreshSessions()
     } catch (reason) {
       flushDelta()
-      setMessages((current) => current.filter((item) => !item.streaming))
-      if (reason.name !== 'AbortError') onError(reason.message)
+      const detail = timedOut
+        ? '请求超过 90 秒，已停止等待'
+        : reason.name === 'AbortError'
+          ? '请求已取消'
+          : reason.message
+      setMessages((current) => current.map((item) => (
+        item.id === localAssistantId
+          ? { ...item, role: 'error', content: `请求失败：${detail}`, status: null, streaming: false }
+          : item
+      )))
+      if (reason.name !== 'AbortError' || timedOut) onError(detail)
     } finally {
+      waitTimersRef.current.forEach((timer) => window.clearTimeout(timer))
+      waitTimersRef.current = []
       abortRef.current = null
+      streamingRef.current = false
       setStreaming(false)
     }
-  }, [contextRefs, createSession, flushDelta, onError, openSession, prompt, refreshSessions, session, strategy, streaming])
+  }, [contextRefs, createSession, flushDelta, onError, openSession, prompt, refreshSessions, session, strategy])
 
   const addAuditContext = () => {
     if (!auditDraft || auditContextIds.includes(auditDraft)) return
@@ -295,7 +356,7 @@ export default function AssistantDock({
         {!messages.length && <div className="assistant-empty"><Bot size={20} /><strong>附加截面后开始解盘</strong><span>助手会先检查数据质量，再解释定价、敞口、策略与失效条件。</span></div>}
         {messages.map((message) => <article key={message.id} className={`assistant-message ${message.role}`}>
           <span>{message.role === 'user' ? '你' : 'AI'}</span>
-          <div>{message.content || (message.streaming ? '正在读取冻结截面…' : '')}</div>
+          <MessageContent content={message.content} status={message.status || (message.streaming ? '正在读取冻结截面…' : '')} />
         </article>)}
       </div>
 
