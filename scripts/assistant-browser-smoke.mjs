@@ -70,6 +70,32 @@ try {
     () => document.querySelector('.assistant-quick button')?.disabled === false,
     { timeout: 90_000 },
   )
+  const markdown = await page.$eval('.assistant-message.assistant .assistant-markdown', (element) => ({
+    semanticBlocks: element.querySelectorAll('h1,h2,h3,h4,h5,h6,ul,ol,table,blockquote,pre,strong').length,
+    rawHeading: /(^|\n)#{1,6}\s/.test(element.textContent || ''),
+  }))
+  if (!markdown.semanticBlocks) throw new Error('assistant response did not render semantic Markdown')
+  if (markdown.rawHeading) throw new Error('assistant response still exposes raw Markdown heading markers')
+  const scrollState = await page.$eval('.assistant-messages', (element) => ({
+    scrollable: element.scrollHeight > element.clientHeight,
+    distanceFromLatest: element.scrollHeight - element.scrollTop - element.clientHeight,
+  }))
+  if (!scrollState.scrollable) throw new Error('assistant response is too short to verify output following')
+  if (scrollState.distanceFromLatest > 48) throw new Error(`assistant did not follow latest output: ${scrollState.distanceFromLatest}px`)
+  await page.$eval('.assistant-messages', (element) => {
+    element.scrollTop = 0
+    element.dispatchEvent(new Event('scroll', { bubbles: true }))
+  })
+  await page.waitForSelector('.assistant-follow', { visible: true, timeout: 5_000 })
+  await page.$eval('.assistant-follow', (button) => button.click())
+  await page.waitForFunction(
+    () => {
+      const element = document.querySelector('.assistant-messages')
+      return element && element.scrollHeight - element.scrollTop - element.clientHeight < 48
+        && !document.querySelector('.assistant-follow')
+    },
+    { timeout: 5_000 },
+  )
   const desktopMessageCount = await page.$$eval('.assistant-message', (items) => items.length)
   if (desktopMessageCount !== 2) throw new Error(`expected 2 desktop messages, got ${desktopMessageCount}`)
   await page.screenshot({ path: path.join(artifactDir, 'desktop-assistant.png') })
@@ -88,6 +114,8 @@ try {
     ok: true,
     desktop,
     mobile,
+    markdown,
+    scrollState,
     desktopMessageCount,
     artifacts: artifactDir,
   }, null, 2))

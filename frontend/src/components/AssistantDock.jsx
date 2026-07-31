@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
+  ArrowDown,
   Bookmark,
   Bot,
   Check,
@@ -11,6 +12,8 @@ import {
   Trash2,
   X,
 } from 'lucide-react'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import { api, apiEventStream, apiJson } from '../lib/api'
 
 const ACTIVE_SESSION_KEY = 'option-workstation-assistant-session-v1'
@@ -26,25 +29,22 @@ function recordLabel(record) {
   return `${record.symbol} · ${time} · ${record.kind}`
 }
 
-function renderInline(text) {
-  return text.split(/(\*\*[^*]+\*\*)/g).map((part, index) => (
-    part.startsWith('**') && part.endsWith('**')
-      ? <strong key={`${part}-${index}`}>{part.slice(2, -2)}</strong>
-      : part
-  ))
-}
-
 function MessageContent({ content, status }) {
   const text = content || status || ''
-  return <div>{text.split('\n').map((line, index) => {
-    const heading = line.match(/^#{1,3}\s+(.+)/)
-    if (heading) return <h4 key={`${line}-${index}`}>{renderInline(heading[1])}</h4>
-    if (/^-{3,}$/.test(line.trim())) return <hr key={`rule-${index}`} />
-    const bullet = line.match(/^[-*]\s+(.+)/)
-    if (bullet) return <p className="assistant-bullet" key={`${line}-${index}`}>{renderInline(bullet[1])}</p>
-    if (!line.trim()) return <span className="assistant-break" key={`break-${index}`} />
-    return <p key={`${line}-${index}`}>{renderInline(line)}</p>
-  })}</div>
+  return (
+    <div className="assistant-markdown">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          a: ({ children, ...props }) => (
+            <a {...props} target="_blank" rel="noreferrer noopener">{children}</a>
+          ),
+        }}
+      >
+        {text}
+      </ReactMarkdown>
+    </div>
+  )
 }
 
 export default function AssistantDock({
@@ -68,7 +68,9 @@ export default function AssistantDock({
   const [prompt, setPrompt] = useState('')
   const [streaming, setStreaming] = useState(false)
   const [saved, setSaved] = useState(false)
+  const [followOutput, setFollowOutput] = useState(true)
   const scrollRef = useRef(null)
+  const followOutputRef = useRef(true)
   const pendingDeltaRef = useRef('')
   const flushTimerRef = useRef(null)
   const abortRef = useRef(null)
@@ -90,6 +92,22 @@ export default function AssistantDock({
     return refs.slice(0, 2)
   }, [auditContextIds, currentSnapshotReady, currentSnapshotRef, useCurrent])
 
+  const setFollowing = useCallback((next) => {
+    followOutputRef.current = next
+    setFollowOutput(next)
+  }, [])
+
+  const scrollToLatest = useCallback((behavior = 'auto') => {
+    const element = scrollRef.current
+    if (!element) return
+    element.scrollTo({ top: element.scrollHeight, behavior })
+  }, [])
+
+  const resumeFollowing = useCallback(() => {
+    setFollowing(true)
+    requestAnimationFrame(() => scrollToLatest('smooth'))
+  }, [scrollToLatest, setFollowing])
+
   const refreshSessions = useCallback(async () => {
     const data = await api('/api/assistant/sessions')
     setSessions(data)
@@ -99,21 +117,23 @@ export default function AssistantDock({
   const openSession = useCallback(async (id) => {
     if (!id) return
     const data = await api(`/api/assistant/sessions/${id}`)
+    setFollowing(true)
     setSession(data)
     setMessages(data.messages || [])
     setSaved(Boolean(data.imported_from))
     localStorage.setItem(ACTIVE_SESSION_KEY, id)
-  }, [])
+  }, [setFollowing])
 
   const createSession = useCallback(async () => {
     const data = await apiJson('/api/assistant/sessions', 'POST', { title: '新解盘' })
+    setFollowing(true)
     setSession(data)
     setMessages([])
     setSaved(false)
     localStorage.setItem(ACTIVE_SESSION_KEY, data.id)
     await refreshSessions()
     return data
-  }, [refreshSessions])
+  }, [refreshSessions, setFollowing])
 
   useEffect(() => {
     let active = true
@@ -141,8 +161,10 @@ export default function AssistantDock({
   }, [createSession, onError, openSession, refreshSessions])
 
   useEffect(() => {
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight })
-  }, [messages])
+    if (!followOutputRef.current) return undefined
+    const frame = requestAnimationFrame(() => scrollToLatest())
+    return () => cancelAnimationFrame(frame)
+  }, [messages, scrollToLatest])
 
   const flushDelta = useCallback(() => {
     flushTimerRef.current = null
@@ -169,6 +191,7 @@ export default function AssistantDock({
       onError('请先附加当前截面或一个收藏截面')
       return
     }
+    setFollowing(true)
     streamingRef.current = true
     setStreaming(true)
     let localAssistantId = ''
@@ -254,7 +277,7 @@ export default function AssistantDock({
       streamingRef.current = false
       setStreaming(false)
     }
-  }, [contextRefs, createSession, flushDelta, onError, openSession, prompt, refreshSessions, session, strategy])
+  }, [contextRefs, createSession, flushDelta, onError, openSession, prompt, refreshSessions, session, setFollowing, strategy])
 
   const addAuditContext = () => {
     if (!auditDraft || auditContextIds.includes(auditDraft)) return
@@ -284,6 +307,7 @@ export default function AssistantDock({
     const imported = await apiJson('/api/assistant/sessions/import', 'POST', {
       audit_record_id: importDraft,
     })
+    setFollowing(true)
     setSession(imported)
     setMessages(imported.messages || [])
     setSaved(true)
@@ -352,12 +376,29 @@ export default function AssistantDock({
         {QUICK_PROMPTS.map(([label, content]) => <button key={label} onClick={() => sendMessage(content)} disabled={!status?.enabled || streaming}>{label}</button>)}
       </div>
 
-      <div className="assistant-messages" ref={scrollRef}>
-        {!messages.length && <div className="assistant-empty"><Bot size={20} /><strong>附加截面后开始解盘</strong><span>助手会先检查数据质量，再解释定价、敞口、策略与失效条件。</span></div>}
-        {messages.map((message) => <article key={message.id} className={`assistant-message ${message.role}`}>
-          <span>{message.role === 'user' ? '你' : 'AI'}</span>
-          <MessageContent content={message.content} status={message.status || (message.streaming ? '正在读取冻结截面…' : '')} />
-        </article>)}
+      <div className="assistant-message-stage">
+        <div
+          className="assistant-messages"
+          ref={scrollRef}
+          role="log"
+          aria-live="polite"
+          onScroll={(event) => {
+            const element = event.currentTarget
+            const atLatest = element.scrollHeight - element.scrollTop - element.clientHeight < 48
+            if (atLatest !== followOutputRef.current) setFollowing(atLatest)
+          }}
+        >
+          {!messages.length && <div className="assistant-empty"><Bot size={20} /><strong>附加截面后开始解盘</strong><span>助手会先检查数据质量，再解释定价、敞口、策略与失效条件。</span></div>}
+          {messages.map((message) => <article key={message.id} className={`assistant-message ${message.role}${message.streaming ? ' streaming' : ''}`}>
+            <span>{message.role === 'user' ? '你' : 'AI'}</span>
+            <MessageContent content={message.content} status={message.status || (message.streaming ? '正在读取冻结截面…' : '')} />
+          </article>)}
+        </div>
+        {!followOutput && (
+          <button className="assistant-follow" type="button" title="回到最新回复" aria-label="回到最新回复" onClick={resumeFollowing}>
+            <ArrowDown size={15} />
+          </button>
+        )}
       </div>
 
       <form className="assistant-composer" onSubmit={(event) => { event.preventDefault(); sendMessage() }}>
