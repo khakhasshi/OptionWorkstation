@@ -13,8 +13,9 @@
 - [ ] Apache-2.0 license choice is confirmed by the copyright owner.
 - [ ] `NOTICE` and `THIRD_PARTY_NOTICES.md` are current.
 - [ ] Dependency licenses pass review.
-- [ ] `cargo audit` reports zero vulnerabilities; all informational warnings
-      and vendored patches have been reviewed.
+- [ ] `./scripts/rustsec-check.sh` reports zero unreviewed vulnerabilities; all
+      documented exceptions, informational warnings, and vendored patches have
+      been reviewed.
 - [ ] The local Longbridge OAuth patch is still necessary, or has been removed
       in favor of an equivalent secure upstream release.
 - [ ] No provider market data or restricted screenshots are tracked.

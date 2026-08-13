@@ -25,6 +25,9 @@ and releases use semantic versioning after the public API stabilizes.
   typed-confirmation gates.
 - Local Longbridge OAuth compatibility patch upgrades the transitive TLS stack
   past RUSTSEC-2026-0098, RUSTSEC-2026-0099, and RUSTSEC-2026-0104.
+- RustSec CI now guards the reviewed lockfile-only `RUSTSEC-2026-0235`
+  exception with an all-target dependency-reachability check.
+- Updated the transitive `nanoid` dependency past `GHSA-2v37-7h3g-55p8`.
 - Publication-time private-path, market-data, oversized-file, and secret scans.
 
 ## [0.1.0] - Unreleased

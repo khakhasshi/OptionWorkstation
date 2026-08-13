@@ -49,6 +49,25 @@ Running the server on a shared host, reverse proxy, or public network without
 additional authentication and isolation is outside the supported threat model.
 See `docs/THREAT_MODEL.md`.
 
+## Reviewed Dependency Advisories
+
+`RUSTSEC-2026-0235` currently appears in `Cargo.lock` because `rust_decimal`
+declares `rkyv 0.7` as an optional dependency. Option Workstation does not
+enable that feature, and `cargo tree --target all -i rkyv` is empty. The
+security workflow therefore ignores this lockfile-only advisory only after a
+separate reachability guard verifies that `rkyv` remains absent from every
+active target dependency tree. If a future dependency enables it, CI fails
+before the exception is applied.
+
+Run the same gate locally with:
+
+```bash
+./scripts/rustsec-check.sh
+```
+
+This exception must be removed when the upstream dependency graph no longer
+records the affected unsupported series.
+
 ## Out of Scope
 
 The following are not security vulnerabilities by themselves:
