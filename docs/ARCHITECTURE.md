@@ -28,7 +28,8 @@ flowchart TB
   subgraph Local Rust Process
     API["Axum HTTP + WebSocket API"]
     REPLAY["ReplayStore"]
-    LIVE["LiveManager"]
+    LIVE["Longbridge LiveManager"]
+    THETALIVE["ThetaLiveManager"]
     ANALYTICS["BSM / Greeks / SVI / surface / exposure"]
     STRATEGY["Strategy risk and paper gates"]
     AUDIT["Redacted hash-chain ledger"]
@@ -36,8 +37,10 @@ flowchart TB
 
   THETA["Licensed ThetaData Parquet"] --> REPLAY
   LB["Longbridge Rust SDK"] --> LIVE
+  THETASDK["ThetaData Python SDK adapter"] --> THETALIVE
   REPLAY --> ANALYTICS
   LIVE --> ANALYTICS
+  THETALIVE --> ANALYTICS
   ANALYTICS --> API
   STRATEGY --> API
   AUDIT --> API
@@ -66,6 +69,8 @@ calculate authoritative analytics, or own execution gates.
 - `replay.rs`: partition discovery, Parquet decoding, and point-in-time reads;
 - `live.rs`: Longbridge contexts, subscriptions, rate limits, cache, and paper
   account operations;
+- `theta_live.rs`: one ThetaData SDK child process, serialized snapshot polling,
+  cache/freshness state, and local WebSocket broadcast;
 - `analytics.rs`: chain construction, IV/Greeks, quality, SVI, and exposure;
 - `volatility.rs`: IV history, realized volatility, VRP, and expected move;
 - `strategy.rs`: executable multi-leg risk and order-plan validation;
@@ -127,6 +132,39 @@ responses. Live option-universe changes are serialized and rate-limited.
 Failed switches attempt subscription rollback while preserving the previous
 stream.
 
+### ThetaData live request flow
+
+```mermaid
+sequenceDiagram
+  participant B as Browser
+  participant A as Axum API
+  participant T as ThetaLiveManager
+  participant P as Python adapter
+  participant S as ThetaData SDK
+
+  B->>A: POST /api/thetadata/connection
+  A->>T: validate and move credentials
+  T->>P: spawn once; connect over NDJSON stdin
+  P->>S: create one authenticated SDK session
+  S-->>P: redacted package status
+  P-->>T: connection status without credentials
+  B->>A: POST /api/live/session provider=thetadata
+  A->>T: configure bounded universe
+  loop configured poll interval
+    T->>P: serialized snapshot request
+    P->>S: stock/option quote and cached metadata calls
+    S-->>P: observations
+    P-->>T: normalized inputs
+    T->>T: Rust analytics and quality gates
+    T-->>B: WS /api/live/stream?provider=thetadata
+  end
+```
+
+The SDK transport is polling, even though the last hop to the browser is a
+local WebSocket. The adapter does not calculate authoritative analytics and
+does not expose an order operation. Invalid-session recovery performs one
+reconnect and retry while preserving serialized access.
+
 ## Strategy and Paper-Order Flow
 
 1. The browser selects legs from a server-produced chain.
@@ -147,6 +185,7 @@ legging and partial-fill risk.
 | State | Location | Lifetime |
 | --- | --- | --- |
 | Longbridge credentials and SDK contexts | Rust process memory | until disconnect/process exit |
+| ThetaData credentials and SDK child session | Rust/Python process memory | until disconnect/process exit |
 | Live quote/depth cache | Rust process memory | active process |
 | Replay decoded cache | Rust process memory | active process |
 | UI layout and collapsed panels | browser local storage | browser profile |

@@ -23,6 +23,8 @@ pub struct StrategyLegInput {
 pub struct StrategyRequest {
     #[serde(default = "default_mode")]
     pub mode: String,
+    #[serde(default = "default_provider")]
+    pub provider: String,
     pub symbol: String,
     pub date: Option<String>,
     pub minute: Option<String>,
@@ -481,6 +483,9 @@ fn default_quantity() -> u32 {
 }
 fn default_mode() -> String {
     "live".into()
+}
+fn default_provider() -> String {
+    "longbridge".into()
 }
 fn default_pricing_mode() -> String {
     "micro".into()

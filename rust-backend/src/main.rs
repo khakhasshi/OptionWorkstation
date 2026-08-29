@@ -5,6 +5,7 @@ mod live;
 mod models;
 mod replay;
 mod strategy;
+mod theta_live;
 mod volatility;
 
 use std::{convert::Infallible, env, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
@@ -39,15 +40,17 @@ use crate::{
     },
     audit::{AuditCaptureRequest, AuditStore},
     live::{LiveManager, option_retry_after_ms},
-    models::{CredentialRequest, LiveSessionRequest, OAuthStartRequest},
+    models::{CredentialRequest, LiveSessionRequest, OAuthStartRequest, ThetaCredentialRequest},
     replay::{ReplaySnapshotParams, ReplayStore},
     strategy::{PaperOrderRequest, StrategyRequest, analyze_strategy},
+    theta_live::ThetaLiveManager,
 };
 
 #[derive(Clone)]
 struct AppState {
     replay: Arc<ReplayStore>,
     live: Arc<LiveManager>,
+    theta: Arc<ThetaLiveManager>,
     audit: Arc<AuditStore>,
     assistant: Arc<AssistantManager>,
 }
@@ -166,6 +169,32 @@ struct AuditListQuery {
     limit: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveProvider {
+    Longbridge,
+    ThetaData,
+}
+
+#[derive(Deserialize)]
+struct LiveProviderQuery {
+    #[serde(default = "default_live_provider")]
+    provider: String,
+}
+
+fn default_live_provider() -> String {
+    "longbridge".into()
+}
+
+fn parse_live_provider(value: &str) -> Result<LiveProvider, ApiError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "longbridge" => Ok(LiveProvider::Longbridge),
+        "thetadata" | "theta" => Ok(LiveProvider::ThetaData),
+        _ => Err(ApiError::bad_request(
+            "provider must be longbridge or thetadata",
+        )),
+    }
+}
+
 fn default_pricing_mode() -> String {
     "micro".into()
 }
@@ -193,6 +222,7 @@ fn validate_minute(value: &str) -> Result<(), ApiError> {
 
 async fn health(State(state): State<AppState>) -> Json<Value> {
     let connection = state.live.status().await;
+    let theta_connection = state.theta.status().await;
     let assistant = state.assistant.status();
     Json(json!({
         "ok": state.replay.root().is_dir(),
@@ -201,7 +231,10 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
         "longbridge_sdk": "4.4.1",
         "data_root": state.replay.root(),
         "audit_ledger": state.audit.path(),
-        "live_connected": connection.connected,
+        "live_connected": connection.connected || theta_connection.connected,
+        "longbridge_connected": connection.connected,
+        "thetadata_connected": theta_connection.connected,
+        "thetadata_transport": "official Python SDK snapshot polling",
         "assistant_enabled": assistant.enabled,
         "assistant_model": assistant.model,
     }))
@@ -344,14 +377,44 @@ async fn disconnect_longbridge(State(state): State<AppState>) -> Json<Value> {
     Json(serde_json::to_value(state.live.disconnect().await).expect("serialize connection status"))
 }
 
+async fn thetadata_connection_status(State(state): State<AppState>) -> Json<Value> {
+    Json(
+        serde_json::to_value(state.theta.status().await)
+            .expect("serialize ThetaData connection status"),
+    )
+}
+
+async fn connect_thetadata(
+    State(state): State<AppState>,
+    Json(credentials): Json<ThetaCredentialRequest>,
+) -> Result<Json<Value>, ApiError> {
+    credentials.validate().map_err(ApiError::bad_request)?;
+    state
+        .theta
+        .connect(credentials)
+        .await
+        .and_then(|value| serde_json::to_value(value).map_err(anyhow::Error::from))
+        .map(Json)
+        .map_err(ApiError::upstream)
+}
+
+async fn disconnect_thetadata(State(state): State<AppState>) -> Json<Value> {
+    Json(
+        serde_json::to_value(state.theta.disconnect().await)
+            .expect("serialize ThetaData connection status"),
+    )
+}
+
 async fn setup_live_session(
     State(state): State<AppState>,
     Json(request): Json<LiveSessionRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    state
-        .live
-        .setup_session(request)
-        .await
+    let provider = parse_live_provider(&request.provider)?;
+    let result = match provider {
+        LiveProvider::Longbridge => state.live.setup_session(request).await,
+        LiveProvider::ThetaData => state.theta.setup_session(request).await,
+    };
+    result
         .and_then(|value| serde_json::to_value(value).map_err(anyhow::Error::from))
         .map(Json)
         .map_err(|error| {
@@ -369,26 +432,47 @@ async fn setup_live_session(
         })
 }
 
-async fn live_snapshot(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    state
-        .live
-        .snapshot()
-        .await
+async fn live_snapshot(
+    State(state): State<AppState>,
+    Query(query): Query<LiveProviderQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let result = match parse_live_provider(&query.provider)? {
+        LiveProvider::Longbridge => state.live.snapshot().await,
+        LiveProvider::ThetaData => state.theta.snapshot().await,
+    };
+    result
         .and_then(|value| serde_json::to_value(value).map_err(anyhow::Error::from))
         .map(Json)
         .map_err(ApiError::conflict)
 }
 
-async fn live_volatility_context(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let snapshot = state.live.snapshot().await.map_err(ApiError::conflict)?;
-    let closes = state
-        .live
-        .daily_closes(45)
-        .await
-        .map_err(ApiError::upstream)?;
+async fn live_volatility_context(
+    State(state): State<AppState>,
+    Query(query): Query<LiveProviderQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let (snapshot, closes, rv_source) = match parse_live_provider(&query.provider)? {
+        LiveProvider::Longbridge => (
+            state.live.snapshot().await.map_err(ApiError::conflict)?,
+            state
+                .live
+                .daily_closes(45)
+                .await
+                .map_err(ApiError::upstream)?,
+            "Longbridge forward-adjusted daily closes",
+        ),
+        LiveProvider::ThetaData => (
+            state.theta.snapshot().await.map_err(ApiError::conflict)?,
+            state
+                .theta
+                .daily_closes(45)
+                .await
+                .map_err(ApiError::upstream)?,
+            "ThetaData daily closes",
+        ),
+    };
     state
         .replay
-        .live_volatility_context(&snapshot.chain, &closes)
+        .live_volatility_context(&snapshot.chain, &closes, rv_source)
         .map(Json)
         .map_err(ApiError::bad_request)
 }
@@ -398,7 +482,11 @@ async fn strategy_analyze(
     Json(request): Json<StrategyRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let chain = if request.mode == "live" {
-        let snapshot = state.live.snapshot().await.map_err(ApiError::conflict)?;
+        let snapshot = match parse_live_provider(&request.provider)? {
+            LiveProvider::Longbridge => state.live.snapshot().await,
+            LiveProvider::ThetaData => state.theta.snapshot().await,
+        }
+        .map_err(ApiError::conflict)?;
         if !request.symbol.eq_ignore_ascii_case(&snapshot.chain.symbol) {
             return Err(ApiError::conflict(
                 "live symbol changed; refresh the strategy",
@@ -580,16 +668,30 @@ async fn resolve_assistant_context(
                 strategy,
             }))
         }
-        AssistantSnapshotRef::Live => {
-            let snapshot = state.live.snapshot().await.map_err(ApiError::conflict)?;
-            let closes = state
-                .live
-                .daily_closes(45)
-                .await
-                .map_err(ApiError::upstream)?;
+        AssistantSnapshotRef::Live { provider } => {
+            let (snapshot, closes, rv_source) = match parse_live_provider(&provider)? {
+                LiveProvider::Longbridge => (
+                    state.live.snapshot().await.map_err(ApiError::conflict)?,
+                    state
+                        .live
+                        .daily_closes(45)
+                        .await
+                        .map_err(ApiError::upstream)?,
+                    "Longbridge forward-adjusted daily closes",
+                ),
+                LiveProvider::ThetaData => (
+                    state.theta.snapshot().await.map_err(ApiError::conflict)?,
+                    state
+                        .theta
+                        .daily_closes(45)
+                        .await
+                        .map_err(ApiError::upstream)?,
+                    "ThetaData daily closes",
+                ),
+            };
             let volatility = state
                 .replay
-                .live_volatility_context(&snapshot.chain, &closes)
+                .live_volatility_context(&snapshot.chain, &closes, rv_source)
                 .map_err(ApiError::bad_request)?;
             let label = format!("{} LIVE {}", snapshot.chain.symbol, snapshot.chain.minute);
             let symbol = snapshot.chain.symbol.clone();
@@ -771,6 +873,11 @@ async fn submit_paper_orders(
             "paper orders require a live strategy",
         ));
     }
+    if parse_live_provider(&request.strategy.provider)? != LiveProvider::Longbridge {
+        return Err(ApiError::conflict(
+            "ThetaData is a market-data source only; paper orders require a Longbridge-priced preview",
+        ));
+    }
     let snapshot = state.live.snapshot().await.map_err(ApiError::conflict)?;
     if !request
         .strategy
@@ -841,9 +948,17 @@ async fn cancel_paper_order(
 
 async fn live_stream(
     State(state): State<AppState>,
+    Query(query): Query<LiveProviderQuery>,
     websocket: WebSocketUpgrade,
-) -> impl IntoResponse {
-    websocket.on_upgrade(move |socket| stream_socket(socket, state.live))
+) -> Result<Response, ApiError> {
+    Ok(match parse_live_provider(&query.provider)? {
+        LiveProvider::Longbridge => websocket
+            .on_upgrade(move |socket| stream_socket(socket, state.live))
+            .into_response(),
+        LiveProvider::ThetaData => websocket
+            .on_upgrade(move |socket| stream_theta_socket(socket, state.theta))
+            .into_response(),
+    })
 }
 
 async fn stream_socket(socket: WebSocket, live: Arc<LiveManager>) {
@@ -891,6 +1006,45 @@ async fn stream_socket(socket: WebSocket, live: Arc<LiveManager>) {
     }
 }
 
+async fn stream_theta_socket(socket: WebSocket, live: Arc<ThetaLiveManager>) {
+    let (mut sender, mut receiver) = socket.split();
+    let mut events = live.subscribe();
+    if let Ok(snapshot) = live.snapshot().await
+        && sender
+            .send(Message::Text(
+                serde_json::to_string(&snapshot).unwrap().into(),
+            ))
+            .await
+            .is_err()
+    {
+        return;
+    }
+    loop {
+        tokio::select! {
+            event = events.recv() => {
+                match event {
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+                let payload = match live.snapshot().await {
+                    Ok(snapshot) => serde_json::to_string(&snapshot).unwrap(),
+                    Err(error) => json!({"kind": "live_error", "detail": error.to_string()}).to_string(),
+                };
+                if sender.send(Message::Text(payload.into())).await.is_err() { break; }
+            }
+            message = receiver.next() => {
+                match message {
+                    Some(Ok(Message::Ping(value)))
+                        if sender.send(Message::Pong(value.clone())).await.is_err() => break,
+                    Some(Ok(Message::Ping(_))) => {}
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
 fn app(state: AppState, frontend_dist: PathBuf) -> Router {
     let index = frontend_dist.join("index.html");
     Router::new()
@@ -907,6 +1061,12 @@ fn app(state: AppState, frontend_dist: PathBuf) -> Router {
             get(connection_status)
                 .post(connect_longbridge)
                 .delete(disconnect_longbridge),
+        )
+        .route(
+            "/api/thetadata/connection",
+            get(thetadata_connection_status)
+                .post(connect_thetadata)
+                .delete(disconnect_thetadata),
         )
         .route("/api/oauth/status", get(oauth_status))
         .route("/api/oauth/start", post(start_oauth))
@@ -985,6 +1145,8 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(7311);
     let live = LiveManager::new(risk_free_rate);
     live.start_refresh_loop();
+    let theta = ThetaLiveManager::new(risk_free_rate);
+    theta.start_refresh_loop();
     let audit_path = env::var("OPTION_WORKSTATION_AUDIT_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
@@ -996,6 +1158,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         replay: Arc::new(ReplayStore::new(data_root, risk_free_rate)),
         live,
+        theta,
         audit: Arc::new(AuditStore::new(audit_path)),
         assistant: Arc::new(AssistantManager::new()),
     };

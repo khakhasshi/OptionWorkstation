@@ -28,6 +28,57 @@ default file storage. Starting a new flow or disconnecting cancels a pending
 flow. This mechanism does not add authentication or authorization to the
 HTTP API, so public or multi-user deployments remain unsupported.
 
+## ThetaData live authorization
+
+`GET /api/thetadata/connection` returns a redacted connection status.
+`POST /api/thetadata/connection` starts one official ThetaData Python SDK
+session with either an inline pair:
+
+```json
+{"email":"research@example.com","password":"process-memory-only"}
+```
+
+or an empty body to use `THETADATA_EMAIL` / `THETADATA_PASSWORD` or the official
+SDK credentials file configured on the server:
+
+```json
+{"email":"","password":""}
+```
+
+`DELETE /api/thetadata/connection` terminates the SDK subprocess and clears the
+in-memory session. Status responses expose provider, packages, freshness, active
+symbol, and error state, but never return credentials.
+
+## Live provider selection
+
+`POST /api/live/session` accepts a `provider` field. Omitting it preserves the
+pre-existing `longbridge` default:
+
+```json
+{
+  "provider": "thetadata",
+  "symbol": "SPY",
+  "expiration": null,
+  "max_contracts": 420,
+  "surface_expiries": 4,
+  "moneyness_window": 0.12,
+  "pricing_mode": "micro",
+  "dealer_model": "classic"
+}
+```
+
+The following live reads accept `?provider=longbridge|thetadata` and default to
+Longbridge for compatibility:
+
+- `GET /api/live/snapshot`;
+- `GET /api/live/volatility-context`;
+- `WS /api/live/stream`.
+
+Live `POST /api/strategy/analyze` requests and assistant live context references
+also accept `provider`. ThetaData is a market-data-only provider: `POST
+/api/trade/orders` rejects any strategy whose provider is not Longbridge, even
+when all other paper gates are enabled.
+
 ## Point-in-time replay snapshot
 
 `GET /api/v1/replay/snapshot` (the unversioned `/api/replay/snapshot` alias is
@@ -101,6 +152,8 @@ retention policy without exposing credentials. `GET` or `POST`
 ```
 
 `context_refs` may contain at most two `replay`, `live`, or `audit` references.
+A live reference may include `{"kind":"live","provider":"thetadata"}`;
+omitting `provider` selects Longbridge.
 The server resolves and freezes each reference, retains all panel metrics and
 provenance, selects at most 96 decision-relevant chain rows, downsamples the
 surface, and includes up to 90 underlying bars. The response uses Server-Sent

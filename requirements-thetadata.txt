@@ -1,0 +1,2 @@
+# Optional dependency set for ThetaData live snapshot polling.
+thetadata==1.0.7

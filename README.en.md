@@ -7,7 +7,7 @@
 [![Vite](https://img.shields.io/badge/Vite-7-646cff?logo=vite&logoColor=white)](frontend/package.json)
 [![ECharts](https://img.shields.io/badge/ECharts-6-aa344d)](frontend/package.json)
 [![Longbridge](https://img.shields.io/badge/Longbridge-Rust%20SDK-00b386)](docs/DATA_SOURCES.md)
-[![ThetaData](https://img.shields.io/badge/ThetaData-Parquet-4b5563)](docs/DATA_SOURCES.md)
+[![ThetaData](https://img.shields.io/badge/ThetaData-Replay%20%2B%20Live-4b5563)](docs/DATA_SOURCES.md)
 [![Docker](https://img.shields.io/badge/Docker-ready-2496ed?logo=docker&logoColor=white)](Dockerfile)
 [![License](https://img.shields.io/badge/License-Apache--2.0-blue)](LICENSE)
 
@@ -37,7 +37,8 @@ prices without saying which is which. Option Workstation keeps those layers
 visible:
 
 - historical replay reads point-in-time local ThetaData Parquet partitions;
-- live mode uses the official Longbridge Rust SDK and reports feed freshness;
+- live mode selects either official Longbridge Rust SDK streaming or official
+  ThetaData Python SDK snapshot polling and reports transport and freshness;
 - bid/ask availability, quote age, and metadata coverage remain explicit;
 - BSM, SVI, surface projection, Greeks, GEX, IV/RV context, and strategy
   scenarios are calculated by the Rust server;
@@ -54,7 +55,7 @@ metrics remain missing rather than being fabricated.
 | Area | Current capability | Trust boundary |
 | --- | --- | --- |
 | Historical replay | Multi-symbol intraday bars, option chains, expiries, synchronized stepping | Requires separately licensed ThetaData files |
-| Live analytics | Longbridge quote/depth subscriptions and normalized WebSocket snapshots | Availability depends on account permissions and provider limits |
+| Live analytics | Longbridge streaming or ThetaData snapshot polling, normalized to local WebSocket snapshots | Availability depends on account permissions, plans, and provider limits |
 | Volatility | BSM IV/Greeks, matched-DTE IV history, RV5/10/20, VRP, expected move | BSM is a European approximation for American-listed options |
 | Smile and surface | Call/put smile, SVI slice, residuals, term structure, constrained 3D projection | Projection is research-grade, not a mathematical no-arbitrage proof |
 | Dealer exposure | GEX, vanna, charm, walls, gamma flip | Dealer sign convention is an assumption, not observed inventory |
@@ -70,6 +71,7 @@ The shipped application is served by `rust-backend/`.
 ```mermaid
 flowchart LR
   A["ThetaData Parquet<br/>historical replay"] --> R["Rust analytics server"]
+  T["ThetaData Python SDK<br/>live snapshot polling"] --> R
   B["Longbridge OAuth / Rust SDK<br/>live quote and paper account"] --> R
   R --> C["BSM / Greeks / SVI"]
   R --> D["Surface / GEX / volatility context"]
@@ -92,9 +94,9 @@ trust flows.
 
 - Rust stable with `rustfmt` and `clippy`
 - Node.js 22 and npm
-- Python 3.11+ only if running the legacy parity tests
+- Python 3.12+ for ThetaData live mode or legacy parity tests
 - a licensed replay dataset for historical mode
-- optional Longbridge OAuth Client ID or OpenAPI credentials for live mode
+- optional Longbridge OpenAPI or ThetaData credentials for live mode
 
 ### Local
 
@@ -157,12 +159,21 @@ licensing constraints are documented in
 ## Live Mode
 
 1. Open the workstation and select **Live**.
-2. Open the connection dialog and prefer **Longbridge OAuth 2.0**: enter the
-   registered OAuth Client ID, open the authorization page, and complete the
-   provider consent flow in the browser.
-3. If OAuth is not available for the application, enter the Longbridge app key,
-   app secret, and access token as a compatibility fallback.
-4. Connect, select an underlying and expiry, and wait for quality gates.
+2. Select **Longbridge** or **ThetaData** in the top bar or connection dialog.
+3. For Longbridge, prefer OAuth 2.0; app key, app secret, and access token remain
+   available as a compatibility fallback.
+4. For ThetaData, first run `./scripts/setup-thetadata.sh`, then enter the account
+   email and password in the dialog, or let the server read `THETADATA_EMAIL`,
+   `THETADATA_PASSWORD`, or an official SDK credentials file.
+5. Connect, select an underlying and expiry, and wait for quality gates.
+
+The official ThetaData Python SDK currently exposes request/response snapshots,
+not a streaming WebSocket. Option Workstation maintains one SDK session,
+serializes requests, polls option quotes every five seconds by default, and
+publishes normalized snapshots through the workstation's local WebSocket. Open
+interest uses a slower cache. Rust remains authoritative for BSM, IV, Greeks,
+SVI, GEX, surfaces, and strategy risk. Shorter polling consumes more provider
+quota, network bandwidth, and CPU.
 
 The local OAuth callback listens on `127.0.0.1:60355`. Credentials are sent
 only to the same-origin Rust API and held in SDK contexts in process memory.
@@ -170,6 +181,12 @@ They are never returned to the browser, persisted in local storage, written to
 the repository, or accepted by audit records. Disconnecting or stopping the
 process clears the in-memory session. OAuth is provider authorization, not
 application-user authentication.
+
+ThetaData email/password values follow the same process-memory-only boundary:
+the Rust API passes them to the adapter over child-process stdin and never
+returns or stores them in browser storage, logs, audit records, or the
+repository. ThetaData is market-data-only in this project. A strategy preview
+priced from ThetaData is never eligible for paper-order submission.
 
 Do not expose the service to a network without adding authentication, TLS,
 origin restrictions, and host-level access controls. The default binding is
@@ -202,6 +219,11 @@ Real-money account order submission is rejected by design.
 | `OPTION_WORKSTATION_RISK_FREE_RATE` | `0.043` | BSM risk-free rate |
 | `OPTION_WORKSTATION_FRONTEND_DIST` | `./frontend/dist` | Built static frontend |
 | `OPTION_WORKSTATION_AUDIT_PATH` | `~/.option-workstation/audit.jsonl` | Append-only research ledger |
+| `OPTION_WORKSTATION_THETADATA_PYTHON` | `.venv-thetadata/bin/python` or `python3` | Python executable for the ThetaData SDK adapter |
+| `OPTION_WORKSTATION_THETADATA_POLL_SECONDS` | `5` | ThetaData snapshot interval, bounded to 2-60 seconds |
+| `OPTION_WORKSTATION_THETADATA_STALE_AFTER_MS` | `15000` | ThetaData quote staleness threshold |
+| `THETADATA_EMAIL` / `THETADATA_PASSWORD` | unset | Optional server-environment ThetaData credentials |
+| `THETADATA_CREDENTIALS_FILE` | unset | Optional official SDK credentials-file path |
 | `OPTION_WORKSTATION_LLM_API_KEY` | unset | Server-side OpenAI-compatible API key |
 | `OPTION_WORKSTATION_LLM_MODEL` | unset | Assistant model; both model and key are required |
 | `OPTION_WORKSTATION_LLM_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible API root |
@@ -228,6 +250,7 @@ or commit, log, or audit a real credential.
 | `/api/volatility-context` | `GET` | Point-in-time IV/RV/VRP/expected move |
 | `/api/oauth/start` | `POST` | Start a Longbridge OAuth provider authorization flow |
 | `/api/oauth/status` | `GET` | Poll OAuth flow state without exposing tokens |
+| `/api/thetadata/connection` | `GET`, `POST`, `DELETE` | Inspect, establish, or disconnect an in-process ThetaData session |
 | `/api/live/session` | `POST`, `DELETE` | Configure or disconnect live SDK session |
 | `/api/live/snapshot` | `GET` | Current normalized live snapshot |
 | `/api/live/stream` | `WS` | Throttled live snapshot stream |

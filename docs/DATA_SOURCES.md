@@ -109,6 +109,40 @@ Longbridge aggregate option data is not a substitute for a historical full-chain
 NBBO replay dataset. A backtest claiming executable historical fills needs the
 actual contract and quote observations available at each signal time.
 
+## Live ThetaData Data
+
+ThetaData live mode uses the separately installed official Python SDK. The SDK
+is request/response based, so the integration is deliberately described as
+**snapshot polling**, not exchange streaming:
+
+- Rust owns one long-lived adapter child process and one authenticated SDK
+  session;
+- adapter requests are serialized over newline-delimited JSON on stdin/stdout;
+- quote snapshots are polled every five seconds by default and normalized into
+  the same Rust `LiveSnapshot` contract used by the frontend;
+- open interest and expiration definitions use slower caches to avoid repeating
+  expensive metadata calls on every frame;
+- the normalized result is broadcast to local browsers over the workstation's
+  WebSocket; this local WebSocket does not turn the upstream feed into a native
+  streaming source;
+- daily closes are requested separately for RV context.
+
+The adapter transfers observations only. Rust remains the sole authoritative
+implementation for executable-side pricing, BSM IV and Greeks, SVI, surface
+projection, dealer-exposure scenarios, volatility context, and strategy risk.
+An invalid SDK session is re-established once and the request retried; arbitrary
+parallel SDK calls are not issued.
+
+The default poll interval is controlled by
+`OPTION_WORKSTATION_THETADATA_POLL_SECONDS` and is bounded to 2-60 seconds.
+Lowering it increases request volume, CPU, and network use and may exceed the
+operator's ThetaData plan. Entitlements, history depth, and quote latency vary
+by subscription. The workstation reports actual coverage and freshness instead
+of assuming a plan capability.
+
+ThetaData has no account or order role in Option Workstation. Its strategy
+previews are research-only and are rejected by the paper-order endpoint.
+
 ## Data Quality States
 
 Every consumer should distinguish:

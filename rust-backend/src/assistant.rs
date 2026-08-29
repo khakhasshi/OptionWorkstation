@@ -164,10 +164,17 @@ pub enum AssistantSnapshotRef {
         #[serde(default = "default_max_dte")]
         max_dte: i64,
     },
-    Live,
+    Live {
+        #[serde(default = "default_live_provider")]
+        provider: String,
+    },
     Audit {
         record_id: String,
     },
+}
+
+fn default_live_provider() -> String {
+    "longbridge".into()
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -720,6 +720,7 @@ impl LiveManager {
                 .collect::<String>()
         );
         let status = ConnectionStatus {
+            provider: "longbridge".into(),
             connected: true,
             state: "connected".into(),
             auth_method: auth_method.into(),
@@ -1294,9 +1295,9 @@ impl LiveManager {
             kind: "live_snapshot",
             sequence,
             feed: LiveFeedInfo {
-                source: "Longbridge",
-                transport: "Longbridge Rust SDK WebSocket -> local WebSocket",
-                sdk_version: SDK_VERSION,
+                source: "Longbridge".into(),
+                transport: "Longbridge Rust SDK WebSocket -> local WebSocket".into(),
+                sdk_version: SDK_VERSION.into(),
                 symbol: active.display_symbol,
                 expiration: active.selected_expiration.to_string(),
                 expirations: active.expirations.iter().map(ToString::to_string).collect(),

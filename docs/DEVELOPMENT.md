@@ -4,7 +4,7 @@
 
 - Rust stable, edition 2024
 - Node.js 22
-- Python 3.11+ for legacy parity only
+- Python 3.12+ for the optional ThetaData adapter and legacy parity
 - Chromium or Chrome for browser smoke tests
 
 Use the committed Cargo and npm lockfiles. Dependency changes must update the
@@ -19,6 +19,17 @@ make setup
 
 The default data root is `./data`, which is ignored by Git. The application can
 start without it.
+
+For ThetaData live-mode development, install its isolated SDK environment:
+
+```bash
+./scripts/setup-thetadata.sh
+```
+
+The Rust service discovers `.venv-thetadata/bin/python` automatically. Override
+it with `OPTION_WORKSTATION_THETADATA_PYTHON` when reusing another environment.
+Credentials may be submitted through the loopback UI or read from an ignored,
+mode-`600` `.env`; never add them to fixtures or test output.
 
 ## Run
 
@@ -66,6 +77,17 @@ python -m pytest -q
 The no-data smoke test always runs. Licensed ThetaData parity tests skip unless
 `OPTION_WORKSTATION_DATA_ROOT` points to the expected fixture.
 
+### ThetaData Adapter Tests
+
+```bash
+python3 -m pytest -q tests/test_thetadata_adapter.py
+```
+
+These tests use a fake SDK and verify protocol normalization and invalid-session
+recovery without credentials or network access. A live provider smoke test is
+manual and must report only redacted counts, timestamps, quality, and source
+metadata. Do not record raw licensed rows.
+
 ### Browser Tests
 
 Start the server, then:
@@ -88,6 +110,14 @@ Live switching additionally requires an in-memory Longbridge paper session:
 
 ```bash
 node scripts/live-switch-smoke.mjs http://127.0.0.1:7311
+```
+
+ThetaData live switching can be exercised from the same workstation after its
+connection status is ready. It must never invoke an order endpoint; the server
+also rejects ThetaData-priced paper submissions independently of the browser.
+
+```bash
+RUN_THETADATA_LIVE_SMOKE=1 ./scripts/verify.sh http://127.0.0.1:7311
 ```
 
 Browser automation must never call order mutation routes.

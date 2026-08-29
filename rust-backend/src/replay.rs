@@ -421,6 +421,7 @@ impl ReplayStore {
         &self,
         snapshot: &ChainSnapshot,
         daily_closes: &[(String, f64)],
+        rv_source: &str,
     ) -> anyhow::Result<Value> {
         let history = if self.symbol_dir(&snapshot.symbol).is_dir() {
             self.matched_iv_history(
@@ -445,7 +446,7 @@ impl ReplayStore {
             closes: daily_closes.iter().map(|(_, close)| *close).collect(),
             rv_through: daily_closes.last().map(|(date, _)| date.clone()),
             iv_source: "ThetaData 50-session matched-DTE ATM IV".into(),
-            rv_source: "Longbridge forward-adjusted daily closes".into(),
+            rv_source: rv_source.into(),
         }))
         .map_err(anyhow::Error::from)
     }

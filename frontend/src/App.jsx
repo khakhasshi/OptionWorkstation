@@ -102,8 +102,11 @@ function App() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [connection, setConnection] = useState({ connected: false, state: 'disconnected', auth_method: 'none', packages: [], subscribed_contracts: 0 })
+  const [thetaConnection, setThetaConnection] = useState({ provider: 'thetadata', connected: false, state: 'disconnected', auth_method: 'none', packages: [], subscribed_contracts: 0 })
+  const [liveProvider, setLiveProvider] = useState(() => localStorage.getItem('option-workstation-live-provider') === 'thetadata' ? 'thetadata' : 'longbridge')
   const [credentialOpen, setCredentialOpen] = useState(false)
   const [credentials, setCredentials] = useState({ app_key: '', app_secret: '', access_token: '' })
+  const [thetaCredentials, setThetaCredentials] = useState({ email: '', password: '' })
   const [oauthClientId, setOauthClientId] = useState('')
   const [oauthStatus, setOauthStatus] = useState({ status: 'idle', flow_id: null, client_id: null, authorization_url: null, error: null })
   const [liveSymbolDraft, setLiveSymbolDraft] = useState('SPY')
@@ -111,6 +114,7 @@ function App() {
   const [liveSocketState, setLiveSocketState] = useState('idle')
   const [liveReconnectCount, setLiveReconnectCount] = useState(0)
   const [liveSwitch, setLiveSwitch] = useState(null)
+  const [pendingLiveExpiration, setPendingLiveExpiration] = useState('')
   const [liveSettings, setLiveSettings] = useState({ max_contracts: 420, surface_expiries: 4, moneyness_window: 0.12 })
   const [tradeAccount, setTradeAccount] = useState(null)
   const [orders, setOrders] = useState([])
@@ -125,6 +129,7 @@ function App() {
   const liveRequestRef = useRef({ id: 0, controller: null, timer: null })
   const replaySnapshotRequestRef = useRef({ id: 0, controller: null })
   const pendingWorkspaceFrameRef = useRef(null)
+  const selectedConnection = liveProvider === 'thetadata' ? thetaConnection : connection
 
   const refreshAudit = useCallback(async () => {
     const records = await api('/api/audit/records?limit=50')
@@ -153,9 +158,10 @@ function App() {
   }, [connection.connected, connection.trade_connected])
 
   useEffect(() => {
-    Promise.all([api('/api/catalog'), api('/api/connection'), api('/api/oauth/status')]).then(([data, status, oauth]) => {
+    Promise.all([api('/api/catalog'), api('/api/connection'), api('/api/thetadata/connection'), api('/api/oauth/status')]).then(([data, status, thetaStatus, oauth]) => {
       setCatalog(data)
       setConnection(status)
+      setThetaConnection(thetaStatus)
       setOauthStatus(oauth)
       setTradingDate(data.common_dates.at(-1) || '')
     }).catch((reason) => setError(reason.message))
@@ -234,18 +240,20 @@ function App() {
       series: { [symbol]: { bars, expirations: data.feed.expirations } },
     })
     setFrame(Math.max(0, timeline.length - 1))
-    setConnection((current) => ({ ...current, state: 'streaming', subscribed_contracts: data.feed.subscribed_contracts, last_event_at: data.feed.as_of }))
+    const updateConnection = (current) => ({ ...current, state: data.feed.source === 'ThetaData' ? 'polling' : 'streaming', subscribed_contracts: data.feed.subscribed_contracts, last_event_at: data.feed.as_of })
+    if (data.feed.source === 'ThetaData') setThetaConnection(updateConnection)
+    else setConnection(updateConnection)
     if (!pendingLiveSymbolRef.current) setError('')
   }, [])
 
   useEffect(() => {
-    if (mode !== 'live' || !connection.connected || liveFeed) return
-    api('/api/live/snapshot')
+    if (mode !== 'live' || !selectedConnection.connected || liveFeed) return
+    api(`/api/live/snapshot?provider=${liveProvider}`)
       .then(applyLiveSnapshot)
       .catch((reason) => {
         if (!reason.message.includes('尚未建立')) setError(reason.message)
       })
-  }, [mode, connection.connected, Boolean(liveFeed), applyLiveSnapshot])
+  }, [mode, liveProvider, selectedConnection.connected, Boolean(liveFeed), applyLiveSnapshot])
 
   const switchMode = (nextMode) => {
     if (nextMode === mode) return
@@ -254,6 +262,7 @@ function App() {
     window.clearTimeout(pending.timer)
     liveRequestRef.current = { id: pending.id + 1, controller: null, timer: null }
     pendingLiveSymbolRef.current = null
+    setPendingLiveExpiration('')
     setLiveSwitch(null)
     setMode(nextMode)
     setPlaying(false)
@@ -279,6 +288,31 @@ function App() {
     window.history.replaceState({}, '', url)
   }
 
+  const selectLiveProvider = (provider) => {
+    if (provider === liveProvider) return
+    const pending = liveRequestRef.current
+    pending.controller?.abort()
+    window.clearTimeout(pending.timer)
+    liveRequestRef.current = { id: pending.id + 1, controller: null, timer: null }
+    pendingLiveSymbolRef.current = null
+    setPendingLiveExpiration('')
+    liveSequenceRef.current = -1
+    setLiveSwitch(null)
+    setLiveProvider(provider)
+    localStorage.setItem('option-workstation-live-provider', provider)
+    setLiveSettings((current) => ({ ...current, max_contracts: Math.min(current.max_contracts, provider === 'thetadata' ? 1000 : 480) }))
+    setLiveFeed(null)
+    setLiveSocketState('idle')
+    setLiveReconnectCount(0)
+    setSession(null)
+    setChain(null)
+    setSurface(null)
+    setVolContext(null)
+    setSnapshotMeta(null)
+    setStrategyAnalysis(null)
+    setError('')
+  }
+
   const submitCredentials = async (event) => {
     event.preventDefault()
     setLoading(true)
@@ -287,6 +321,23 @@ function App() {
       const status = await apiJson('/api/connection', 'POST', credentials)
       setConnection(status)
       setCredentials({ app_key: '', app_secret: '', access_token: '' })
+      setCredentialOpen(false)
+    } catch (reason) {
+      setError(reason.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const submitThetaCredentials = async (event, useEnvironment = false) => {
+    event?.preventDefault()
+    setLoading(true)
+    setError('')
+    try {
+      const payload = useEnvironment ? { email: '', password: '' } : thetaCredentials
+      const status = await apiJson('/api/thetadata/connection', 'POST', payload)
+      setThetaConnection(status)
+      setThetaCredentials({ email: '', password: '' })
       setCredentialOpen(false)
     } catch (reason) {
       setError(reason.message)
@@ -316,6 +367,7 @@ function App() {
       window.clearTimeout(pending.timer)
       liveRequestRef.current = { id: pending.id + 1, controller: null, timer: null }
       pendingLiveSymbolRef.current = null
+      setPendingLiveExpiration('')
       setLiveSwitch(null)
       const status = await apiJson('/api/connection', 'DELETE')
       setConnection(status)
@@ -335,8 +387,33 @@ function App() {
     }
   }
 
-  const startLive = async () => {
-    if (!connection.connected) {
+  const disconnectThetaData = async () => {
+    try {
+      const pending = liveRequestRef.current
+      pending.controller?.abort()
+      window.clearTimeout(pending.timer)
+      liveRequestRef.current = { id: pending.id + 1, controller: null, timer: null }
+      pendingLiveSymbolRef.current = null
+      setPendingLiveExpiration('')
+      setLiveSwitch(null)
+      setThetaConnection(await apiJson('/api/thetadata/connection', 'DELETE'))
+      liveSequenceRef.current = -1
+      setLiveFeed(null)
+      setLiveSocketState('idle')
+      setLiveReconnectCount(0)
+      setSnapshotMeta(null)
+      if (mode === 'live') {
+        setSession(null)
+        setChain(null)
+        setSurface(null)
+      }
+    } catch (reason) {
+      setError(reason.message)
+    }
+  }
+
+  const startLive = async ({ expirationOverride = null } = {}) => {
+    if (!selectedConnection.connected) {
       setCredentialOpen(true)
       return
     }
@@ -349,14 +426,25 @@ function App() {
     previous.controller?.abort()
     window.clearTimeout(previous.timer)
     const requestId = previous.id + 1
+    const requestedExpiration = expirationOverride || (
+      liveFeed?.symbol === requestedSymbol && liveFeed.expirations.includes(expiration)
+        ? expiration
+        : null
+    )
+    if (requestedExpiration && liveFeed?.symbol === requestedSymbol && !liveFeed.expirations.includes(requestedExpiration)) {
+      setError('所选期日不在当前实时会话的可用列表中')
+      return
+    }
     const request = {
+      provider: liveProvider,
       symbol: requestedSymbol,
-      expiration: liveFeed?.symbol === requestedSymbol && liveFeed.expirations.includes(expiration) ? expiration : null,
+      expiration: requestedExpiration,
       pricing_mode: pricingMode,
       dealer_model: dealerModel,
       ...liveSettings,
     }
     pendingLiveSymbolRef.current = requestedSymbol
+    if (expirationOverride) setPendingLiveExpiration(requestedExpiration || '')
     setLiveSwitch({ status: 'switching', symbol: requestedSymbol, retryAt: null })
 
     const attempt = async () => {
@@ -369,11 +457,12 @@ function App() {
       try {
         const snapshot = await apiJson('/api/live/session', 'POST', request, { signal: controller.signal })
         if (liveRequestRef.current.id !== requestId) return
-        pendingLiveSymbolRef.current = null
         setLiveSwitch(null)
         setLiveSymbolDraft(snapshot.feed.symbol)
         surfaceUpdateRef.current = { at: 0, key: '' }
         applyLiveSnapshot(snapshot, true)
+        pendingLiveSymbolRef.current = null
+        setPendingLiveExpiration('')
       } catch (reason) {
         if (reason.name === 'AbortError' || liveRequestRef.current.id !== requestId) return
         if (reason.status === 429) {
@@ -381,11 +470,12 @@ function App() {
           const retryAt = Date.now() + retryAfterMs
           retryScheduled = true
           setLiveSwitch({ status: 'queued', symbol: requestedSymbol, retryAt })
-          setError(`${requestedSymbol} 已排队等待 Longbridge 限频窗口；当前 ${liveFeed?.symbol || activeSymbol} 行情继续推送，约 ${Math.ceil(retryAfterMs / 1000)} 秒后自动重试`)
+          setError(`${requestedSymbol} 已排队等待 ${liveProvider === 'longbridge' ? 'Longbridge' : 'ThetaData'} 限频窗口；当前 ${liveFeed?.symbol || activeSymbol} 行情继续推送，约 ${Math.ceil(retryAfterMs / 1000)} 秒后自动重试`)
           const timer = window.setTimeout(attempt, retryAfterMs)
           liveRequestRef.current = { id: requestId, controller: null, timer }
         } else {
           pendingLiveSymbolRef.current = null
+          setPendingLiveExpiration('')
           setLiveSwitch({ status: 'failed', symbol: requestedSymbol, retryAt: null })
           setError(reason.message)
         }
@@ -403,20 +493,29 @@ function App() {
     attempt()
   }
 
+  const changeExpiration = (nextExpiration) => {
+    if (!nextExpiration || nextExpiration === (pendingLiveExpiration || expiration)) return
+    if (mode === 'live' && liveFeed?.expirations.includes(nextExpiration)) {
+      startLive({ expirationOverride: nextExpiration })
+    } else {
+      setExpiration(nextExpiration)
+    }
+  }
+
   useEffect(() => () => {
     liveRequestRef.current.controller?.abort()
     window.clearTimeout(liveRequestRef.current.timer)
   }, [])
 
   useEffect(() => {
-    if (mode !== 'live' || !liveFeed || !connection.connected) return undefined
+    if (mode !== 'live' || !liveFeed || !selectedConnection.connected) return undefined
     let socket
     let retryTimer
     let stopped = false
     const connect = () => {
       if (stopped) return
       setLiveSocketState('connecting')
-      socket = new WebSocket(websocketUrl('/api/live/stream'))
+      socket = new WebSocket(websocketUrl(`/api/live/stream?provider=${liveProvider}`))
       socket.onopen = () => setLiveSocketState('streaming')
       socket.onmessage = (event) => {
         try {
@@ -439,7 +538,7 @@ function App() {
       window.clearTimeout(retryTimer)
       socket?.close()
     }
-  }, [mode, Boolean(liveFeed), connection.connected, applyLiveSnapshot])
+  }, [mode, liveProvider, Boolean(liveFeed), selectedConnection.connected, applyLiveSnapshot])
 
 
   useEffect(() => {
@@ -520,9 +619,9 @@ function App() {
   }, [mode, activeSymbol, tradingDate, minute, expiration, pricingMode, dealerModel, playing])
 
   useEffect(() => {
-    if (mode !== 'live' || !liveFeed || !connection.connected) return undefined
+    if (mode !== 'live' || !liveFeed || liveFeed.expiration !== expiration || !selectedConnection.connected) return undefined
     let stopped = false
-    const refresh = () => api('/api/live/volatility-context')
+    const refresh = () => api(`/api/live/volatility-context?provider=${liveProvider}`)
       .then((context) => !stopped && setVolContext(context))
       .catch((reason) => {
         if (!stopped) setError(reason.message)
@@ -533,7 +632,7 @@ function App() {
       stopped = true
       window.clearInterval(timer)
     }
-  }, [mode, activeSymbol, expiration, Boolean(liveFeed), connection.connected])
+  }, [mode, liveProvider, activeSymbol, expiration, liveFeed?.expiration, selectedConnection.connected])
 
   useEffect(() => {
     setStrategyAnalysis(null)
@@ -696,6 +795,7 @@ function App() {
 
   const strategyRequest = () => ({
     mode,
+    provider: liveProvider,
     symbol: activeSymbol,
     date: mode === 'replay' ? tradingDate : null,
     minute: mode === 'replay' ? minute : null,
@@ -812,6 +912,7 @@ function App() {
       name: name.trim(),
       saved_at: new Date().toISOString(),
       mode,
+      liveProvider,
       symbols,
       activeSymbol,
       tradingDate,
@@ -837,6 +938,7 @@ function App() {
     if (!workspace) return
     setWorkspaceId(id)
     setMode(workspace.mode || 'replay')
+    if (workspace.liveProvider) selectLiveProvider(workspace.liveProvider)
     const url = new URL(window.location.href)
     url.searchParams.set('mode', workspace.mode || 'replay')
     window.history.replaceState({}, '', url)
@@ -871,20 +973,23 @@ function App() {
   }
 
   const activeBar = session?.series[activeSymbol]?.bars[frame]
-  const quotePermission = connection.quote_level?.includes('USO') ? 'US Options LV1' : (connection.quote_level ? 'OpenAPI Quotes' : '等待凭证')
+  const quotePermission = liveProvider === 'thetadata'
+    ? (thetaConnection.quote_level || 'ThetaData snapshots')
+    : connection.quote_level?.includes('USO') ? 'US Options LV1' : (connection.quote_level ? 'OpenAPI Quotes' : '等待凭证')
+  const liveStaleAfterMs = liveFeed?.stale_after_ms || (liveProvider === 'thetadata' ? 15000 : 5000)
   const chainQualityReady = Boolean(chain?.quality?.gex_ready)
     && (chain?.quality?.fresh_quote_coverage_pct ?? 0) >= 80
-    && (chain?.quality?.spot_age_ms ?? 0) <= 5000
-  const chainQualityLabel = !chain ? '等待截面' : (chain?.quality?.spot_age_ms ?? 0) > 5000
+    && (chain?.quality?.spot_age_ms ?? 0) <= liveStaleAfterMs
+  const chainQualityLabel = !chain ? '等待截面' : (chain?.quality?.spot_age_ms ?? 0) > liveStaleAfterMs
     ? '现货报价陈旧'
     : (chain?.quality?.fresh_quote_coverage_pct ?? 0) < 80
       ? '期权报价陈旧'
       : chain?.quality?.gex_ready ? '完整截面' : '元数据受限'
-  const chartViewKey = `${mode}:${activeSymbol}:${expiration || 'none'}`
-  const marketViewKey = `${mode}:${activeSymbol}`
+  const chartViewKey = `${mode}:${liveProvider}:${activeSymbol}:${expiration || 'none'}`
+  const marketViewKey = `${mode}:${liveProvider}:${activeSymbol}`
   const assistantSnapshotRef = useMemo(() => {
     if (!chain) return null
-    if (mode === 'live') return { kind: 'live' }
+    if (mode === 'live') return { kind: 'live', provider: liveProvider }
     if (!activeSymbol || !tradingDate || !minute || !expiration) return null
     return {
       kind: 'replay',
@@ -896,7 +1001,7 @@ function App() {
       dealer_model: dealerModel,
       max_dte: 180,
     }
-  }, [activeSymbol, chain, dealerModel, expiration, minute, mode, pricingMode, tradingDate])
+  }, [activeSymbol, chain, dealerModel, expiration, liveProvider, minute, mode, pricingMode, tradingDate])
   const assistantSnapshotLabel = mode === 'live'
     ? `${activeSymbol} · LIVE · ${minute || '--:--'} ET`
     : `${activeSymbol} · ${tradingDate} · ${minute || '--:--'} ET · ${expiration}`
@@ -936,6 +1041,7 @@ function App() {
             </div>
             <select className="date-select" value={tradingDate} onChange={(event) => setTradingDate(event.target.value)}>{catalog?.common_dates.map((item) => <option key={item}>{item}</option>)}</select>
           </> : <label className="live-symbol-control" title="实时美股代码"><span>US</span><input list="live-symbols" value={liveSymbolDraft} maxLength={15} onChange={(event) => setLiveSymbolDraft(event.target.value.toUpperCase())} onKeyDown={(event) => event.key === 'Enter' && startLive()} aria-label="实时美股代码" /><datalist id="live-symbols">{catalog?.symbols.map((symbol) => <option key={symbol} value={symbol} />)}</datalist></label>}
+          {mode === 'live' && <div className="segments provider-switch" aria-label="实时数据源"><button className={liveProvider === 'longbridge' ? 'active' : ''} onClick={() => selectLiveProvider('longbridge')}>Longbridge</button><button className={liveProvider === 'thetadata' ? 'active' : ''} onClick={() => selectLiveProvider('thetadata')}>ThetaData</button></div>}
           <select className="date-select compact" value={pricingMode} onChange={(event) => setPricingMode(event.target.value)}><option value="micro">Micro</option><option value="mid">Mid</option><option value="ask">Ask</option></select>
           <select className="date-select compact" value={dealerModel} onChange={(event) => setDealerModel(event.target.value)}><option value="classic">Call+/Put-</option><option value="short_all">Dealer Short</option><option value="long_all">Dealer Long</option></select>
           <div className="segments layout-switch" aria-label="工作台布局">{[['dense', '总览'], ['vol', '波动率'], ['trade', '交易']].map(([value, label]) => <button key={value} className={layout === value ? 'active' : ''} onClick={() => setLayout(value)}>{label}</button>)}</div>
@@ -944,19 +1050,19 @@ function App() {
           <a className="icon-button action" href="/guide.html" title="打开初学者指南" aria-label="打开初学者指南"><BookOpen size={15} /></a>
           <button className="icon-button action" title="写入审计账本" onClick={() => captureAudit()}><Bookmark size={15} /></button>
           <button className="icon-button action" title="导出研究快照" onClick={exportSnapshot}><Download size={15} /></button>
-          <button className={`connection-button ${connection.connected ? 'connected' : ''}`} onClick={() => setCredentialOpen(true)} title="Longbridge 连接设置">{connection.connected ? <Wifi size={14} /> : <WifiOff size={14} />}<span>{connection.connected ? connection.account_hint || '已连接' : 'Longbridge'}</span></button>
-          {mode === 'live' && <button className="live-run" onClick={startLive} disabled={loading} title="启动或更新实时订阅"><Radio size={14} />{liveSwitch?.status === 'queued' ? `${liveSwitch.symbol} 排队中` : liveFeed ? '更新订阅' : '启动实时'}</button>}
+          <button className={`connection-button ${selectedConnection.connected ? 'connected' : ''}`} onClick={() => setCredentialOpen(true)} title={`${liveProvider === 'thetadata' ? 'ThetaData' : 'Longbridge'} 连接设置`}>{selectedConnection.connected ? <Wifi size={14} /> : <WifiOff size={14} />}<span>{selectedConnection.connected ? selectedConnection.account_hint || '已连接' : liveProvider === 'thetadata' ? 'ThetaData' : 'Longbridge'}</span></button>
+          {mode === 'live' && <button className="live-run" onClick={() => startLive()} disabled={loading} title="启动或更新实时订阅"><Radio size={14} />{liveSwitch?.status === 'queued' ? `${liveSwitch.symbol} 排队中` : liveFeed ? '更新订阅' : '启动实时'}</button>}
         </div>
       </header>
 
       <main className={`research-workspace layout-${layout}`}>
         <section className="workspace-panel market-panel">
-          <div className="market-heading"><div><span className="eyebrow">{activeSymbol} · {mode === 'live' ? 'LONGBRIDGE LIVE' : tradingDate}</span><h1>{activeBar ? activeBar.close.toFixed(2) : '--'} <small>{minute || '--:--'} ET</small></h1></div><div className="ohlc"><span>O <b>{activeBar?.open.toFixed(2)}</b></span><span>H <b>{activeBar?.high.toFixed(2)}</b></span><span>L <b>{activeBar?.low.toFixed(2)}</b></span><span>V <b>{formatCompact(activeBar?.volume)}</b></span></div></div>
+          <div className="market-heading"><div><span className="eyebrow">{activeSymbol} · {mode === 'live' ? `${liveProvider === 'thetadata' ? 'THETADATA POLL' : 'LONGBRIDGE LIVE'}` : tradingDate}</span><h1>{activeBar ? activeBar.close.toFixed(2) : '--'} <small>{minute || '--:--'} ET</small></h1></div><div className="ohlc"><span>O <b>{activeBar?.open.toFixed(2)}</b></span><span>H <b>{activeBar?.high.toFixed(2)}</b></span><span>L <b>{activeBar?.low.toFixed(2)}</b></span><span>V <b>{formatCompact(activeBar?.volume)}</b></span></div></div>
           <Chart option={marketOption} className="market-chart" viewKey={marketViewKey} />
         </section>
 
         <aside className="workspace-panel snapshot-panel">
-          <div className="panel-title"><span>期权截面 <small>{chain?.provenance?.source || '--'}</small></span><select value={expiration} onChange={(event) => setExpiration(event.target.value)}>{session?.series[activeSymbol]?.expirations.map((item) => <option key={item} value={item}>{item} · {Math.max(0, Math.round((new Date(`${item}T16:00:00`) - new Date(`${tradingDate}T09:30:00`)) / 86400000))}D</option>)}</select></div>
+          <div className="panel-title"><span>期权截面 <small>{chain?.provenance?.source || '--'}</small></span><select value={mode === 'live' ? pendingLiveExpiration || expiration : expiration} onChange={(event) => changeExpiration(event.target.value)}>{session?.series[activeSymbol]?.expirations.map((item) => <option key={item} value={item}>{item} · {Math.max(0, Math.round((new Date(`${item}T16:00:00`) - new Date(`${tradingDate}T09:30:00`)) / 86400000))}D</option>)}</select></div>
           <div className={`quality-banner ${chainQualityReady ? 'ready' : 'limited'}`}><span>{chainQualityLabel}</span><b>Q {chain?.quality?.quote_coverage_pct?.toFixed(0) ?? '--'} · Fresh {chain?.quality?.fresh_quote_coverage_pct?.toFixed(0) ?? '--'} · Meta {chain?.quality?.metadata_coverage_pct?.toFixed(0) ?? '--'}%</b></div>
           <div className="snapshot-provenance" title="所有主分析面板使用同一截面快照"><span>Snapshot {snapshotMeta?.snapshot_id?.slice(0, 14) || chain?.snapshot_id?.slice(0, 14) || '--'}</span><span>{snapshotMeta?.model_version || chain?.provenance?.model || '--'}</span><span>{snapshotMeta?.as_of ? new Date(snapshotMeta.as_of).toLocaleTimeString('zh-CN', { hour12: false, timeZone: 'America/New_York' }) : '--:--:--'} ET</span></div>
           <div className="metric-grid">
@@ -996,7 +1102,7 @@ function App() {
           {webgl ? <Suspense fallback={<div className="empty-state">加载 3D 渲染器…</div>}><SurfaceChart option={surfaceOption} viewKey={chartViewKey} /></Suspense> : <Chart option={surfaceOption} incremental viewKey={chartViewKey} />}
         </Panel>
         <Panel id="strategy" className="strategy-panel" title="策略风险引擎" icon={<TableProperties size={14} />} tools={<button className="text-button" onClick={() => setStrategyLegs([])}>清空</button>}>
-          <StrategyWorkbench legs={liveStrategyLegs} setLegs={setStrategyLegs} analysis={strategyAnalysis} quantity={strategyQuantity} setQuantity={setStrategyQuantity} onAnalyze={analyzeCurrentStrategy} payoffOption={payoffOption} onPreset={applyPreset} tradeAccount={tradeAccount} onPaperSubmit={() => setPaperConfirmOpen(true)} analyzing={analyzing} paperEligible={mode === 'live'} />
+          <StrategyWorkbench legs={liveStrategyLegs} setLegs={setStrategyLegs} analysis={strategyAnalysis} quantity={strategyQuantity} setQuantity={setStrategyQuantity} onAnalyze={analyzeCurrentStrategy} payoffOption={payoffOption} onPreset={applyPreset} tradeAccount={tradeAccount} onPaperSubmit={() => setPaperConfirmOpen(true)} analyzing={analyzing} paperEligible={mode === 'live' && liveProvider === 'longbridge'} />
         </Panel>
 
         <Panel id="audit" className="audit-panel" title="研究审计账本" icon={<Bookmark size={14} />}>
@@ -1023,11 +1129,11 @@ function App() {
       </footer> : <footer className="live-dock">
         <div className={`feed-health ${liveSocketState === 'streaming' ? 'healthy' : ''}`}>
           {liveSocketState === 'streaming' ? <Wifi size={16} /> : <WifiOff size={16} />}
-          <div><span>行情推送</span><strong>{connection.connected ? liveSocketState : '未连接'}</strong></div>
+          <div><span>{liveProvider === 'thetadata' ? '快照轮询' : '行情推送'}</span><strong>{selectedConnection.connected ? liveSocketState : '未连接'}</strong></div>
         </div>
         <div className="live-readouts">
           <LiveReadout label="数据时刻" value={liveFeed?.as_of ? new Date(liveFeed.as_of).toLocaleTimeString('zh-CN', { hour12: false }) : '--:--:--'} />
-          <LiveReadout label="订阅合约" value={`${liveFeed?.subscribed_contracts || connection.subscribed_contracts || 0} / 500`} />
+          <LiveReadout label={liveProvider === 'thetadata' ? '轮询合约' : '订阅合约'} value={`${liveFeed?.subscribed_contracts || selectedConnection.subscribed_contracts || 0} / ${liveFeed?.subscription_limit || (liveProvider === 'thetadata' ? 1000 : 500)}`} />
           <LiveReadout label="Fresh Quote" value={`${liveFeed?.fresh_quote_coverage_pct?.toFixed(0) ?? 0}%`} tone={liveFeed?.fresh_quote_coverage_pct >= 90 ? 'healthy' : 'warning'} />
           <LiveReadout label="OI 覆盖" value={`${liveFeed?.metadata_coverage_pct?.toFixed(0) ?? 0}%`} tone={liveFeed?.metadata_coverage_pct >= 90 ? 'healthy' : 'warning'} />
           <LiveReadout label="传输延迟" value={liveFeed?.latency_ms == null ? '--' : `${liveFeed.latency_ms} ms`} tone={liveFeed?.latency_ms < 3000 ? 'healthy' : 'warning'} />
@@ -1035,10 +1141,10 @@ function App() {
           <LiveReadout label="重连次数" value={String(liveReconnectCount)} tone={liveReconnectCount === 0 ? 'healthy' : 'warning'} />
         </div>
         <div className="live-settings">
-          <label title="期权订阅上限"><span>合约</span><input type="number" min="20" max="480" step="20" value={liveSettings.max_contracts} onChange={(event) => setLiveSettings((current) => ({ ...current, max_contracts: Number(event.target.value) }))} /></label>
+          <label title={liveProvider === 'thetadata' ? '每次快照处理的期权合约上限' : '期权订阅上限'}><span>合约</span><input type="number" min="20" max={liveProvider === 'thetadata' ? 1000 : 480} step="20" value={liveSettings.max_contracts} onChange={(event) => setLiveSettings((current) => ({ ...current, max_contracts: Number(event.target.value) }))} /></label>
           <label title="用于 IV 曲面的到期日数量"><span>期限</span><input type="number" min="2" max="6" value={liveSettings.surface_expiries} onChange={(event) => setLiveSettings((current) => ({ ...current, surface_expiries: Number(event.target.value) }))} /></label>
           <label title="现价上下的筛选窗口"><span>价宽 %</span><input type="number" min="4" max="30" step="1" value={Math.round(liveSettings.moneyness_window * 100)} onChange={(event) => setLiveSettings((current) => ({ ...current, moneyness_window: Number(event.target.value) / 100 }))} /></label>
-          <button onClick={startLive} disabled={loading}><RefreshCw size={14} />应用</button>
+          <button onClick={() => startLive()} disabled={loading}><RefreshCw size={14} />应用</button>
         </div>
       </footer>}
 
@@ -1068,34 +1174,48 @@ function App() {
 
       {credentialOpen && <div className="credential-backdrop" onMouseDown={() => setCredentialOpen(false)}>
         <aside className="credential-drawer" role="dialog" aria-modal="true" aria-labelledby="credential-title" onMouseDown={(event) => event.stopPropagation()}>
-          <div className="credential-header"><div><KeyRound size={18} /><div><strong id="credential-title">Longbridge OpenAPI</strong><span>实时行情连接</span></div></div><button className="drawer-close" title="关闭" onClick={() => setCredentialOpen(false)}><X size={17} /></button></div>
-          <div className={`connection-summary ${connection.connected ? 'connected' : ''}`}>
-            {connection.connected ? <Wifi size={17} /> : <WifiOff size={17} />}
-            <div><strong>{connection.connected ? `已连接 ${connection.account_hint || ''}` : '尚未连接'}</strong><span>{quotePermission} · {connection.state} · {connection.auth_method === 'oauth' ? 'OAuth 2.0' : connection.auth_method === 'apikey' ? 'API Key' : '未认证'}</span></div>
+          <div className="credential-header"><div><KeyRound size={18} /><div><strong id="credential-title">实时数据源</strong><span>{liveProvider === 'thetadata' ? 'ThetaData 快照轮询' : 'Longbridge 流式行情'}</span></div></div><button className="drawer-close" title="关闭" onClick={() => setCredentialOpen(false)}><X size={17} /></button></div>
+          <div className="segments credential-provider-switch" aria-label="选择实时数据源"><button className={liveProvider === 'longbridge' ? 'active' : ''} onClick={() => selectLiveProvider('longbridge')}>Longbridge</button><button className={liveProvider === 'thetadata' ? 'active' : ''} onClick={() => selectLiveProvider('thetadata')}>ThetaData</button></div>
+          <div className={`connection-summary ${selectedConnection.connected ? 'connected' : ''}`}>
+            {selectedConnection.connected ? <Wifi size={17} /> : <WifiOff size={17} />}
+            <div><strong>{selectedConnection.connected ? `已连接 ${selectedConnection.account_hint || ''}` : '尚未连接'}</strong><span>{quotePermission} · {selectedConnection.state} · {selectedConnection.auth_method === 'oauth' ? 'OAuth 2.0' : selectedConnection.auth_method === 'apikey' ? 'API Key' : selectedConnection.auth_method === 'environment' ? '环境凭证' : selectedConnection.auth_method === 'credentials' ? '邮箱凭证' : '未认证'}</span></div>
           </div>
-          {connection.connected && <div className="trade-connection-grid"><div><span>Trade API</span><b>{connection.trade_connected ? 'Connected' : 'Unavailable'}</b></div><div><span>Account</span><b>{connection.account_type || '--'}</b></div><div><span>Buying Power</span><b>{connection.buy_power || '--'}</b></div><div><span>Paper Orders</span><b className={connection.order_execution_enabled ? 'ok-text' : 'warning-text'}>{connection.order_execution_enabled ? 'Enabled' : 'Locked'}</b></div></div>}
-          <section className="oauth-section" aria-labelledby="oauth-title">
-            <div className="oauth-heading"><div><Radio size={15} /><strong id="oauth-title">Longbridge OAuth 2.0</strong></div><span>推荐</span></div>
-            <p>使用浏览器完成授权，不需要在工作台输入 App Secret。Access Token 只驻留 Rust 进程内存，不写入浏览器存储或本地文件。</p>
-            <form className="oauth-form" onSubmit={startOAuth} autoComplete="off">
-              <label htmlFor="lb-oauth-client-id"><span>OAuth Client ID / App Key</span><input id="lb-oauth-client-id" type="text" autoComplete="off" placeholder="输入 Longbridge OAuth Client ID" value={oauthClientId} onChange={(event) => setOauthClientId(event.target.value)} /></label>
-              <button className="oauth-button" type="submit" disabled={loading || ['pending', 'connecting'].includes(oauthStatus.status)}><Radio size={14} />{oauthStatus.status === 'connecting' ? '正在建立连接' : oauthStatus.status === 'pending' ? '等待浏览器授权' : '开始 OAuth 授权'}</button>
+          {liveProvider === 'longbridge' ? <>
+            {connection.connected && <div className="trade-connection-grid"><div><span>Trade API</span><b>{connection.trade_connected ? 'Connected' : 'Unavailable'}</b></div><div><span>Account</span><b>{connection.account_type || '--'}</b></div><div><span>Buying Power</span><b>{connection.buy_power || '--'}</b></div><div><span>Paper Orders</span><b className={connection.order_execution_enabled ? 'ok-text' : 'warning-text'}>{connection.order_execution_enabled ? 'Enabled' : 'Locked'}</b></div></div>}
+            <section className="oauth-section" aria-labelledby="oauth-title">
+              <div className="oauth-heading"><div><Radio size={15} /><strong id="oauth-title">Longbridge OAuth 2.0</strong></div><span>推荐</span></div>
+              <p>Access Token 只驻留 Rust 进程内存，不写入浏览器存储或本地文件。</p>
+              <form className="oauth-form" onSubmit={startOAuth} autoComplete="off">
+                <label htmlFor="lb-oauth-client-id"><span>OAuth Client ID / App Key</span><input id="lb-oauth-client-id" type="text" autoComplete="off" placeholder="输入 Longbridge OAuth Client ID" value={oauthClientId} onChange={(event) => setOauthClientId(event.target.value)} /></label>
+                <button className="oauth-button" type="submit" disabled={loading || ['pending', 'connecting'].includes(oauthStatus.status)}><Radio size={14} />{oauthStatus.status === 'connecting' ? '正在建立连接' : oauthStatus.status === 'pending' ? '等待浏览器授权' : '开始 OAuth 授权'}</button>
+              </form>
+              {oauthStatus.authorization_url && <div className="oauth-status"><span>授权页面已准备好</span><a className="oauth-link" href={oauthStatus.authorization_url} target="_blank" rel="noreferrer">打开授权页面</a></div>}
+              {oauthStatus.status === 'pending' && <div className="oauth-status muted">完成授权后此窗口会自动验证连接。</div>}
+              {oauthStatus.status === 'connected' && <div className="oauth-status success">OAuth 已连接，可开始实时会话。</div>}
+              {oauthStatus.status === 'error' && oauthStatus.error && <div className="oauth-status failure">{oauthStatus.error}</div>}
+            </section>
+            <form className="credential-form" onSubmit={submitCredentials} autoComplete="off">
+              <label htmlFor="lb-app-key"><span>App Key</span><input id="lb-app-key" type="password" autoComplete="new-password" value={credentials.app_key} onChange={(event) => setCredentials((current) => ({ ...current, app_key: event.target.value }))} /></label>
+              <label htmlFor="lb-app-secret"><span>App Secret</span><input id="lb-app-secret" type="password" autoComplete="new-password" value={credentials.app_secret} onChange={(event) => setCredentials((current) => ({ ...current, app_secret: event.target.value }))} /></label>
+              <label htmlFor="lb-access-token"><span>Access Token</span><textarea id="lb-access-token" rows="4" autoComplete="off" value={credentials.access_token} onChange={(event) => setCredentials((current) => ({ ...current, access_token: event.target.value }))} /></label>
+              <div className="credential-security"><LockKeyhole size={15} /><span>凭证仅驻留当前 Rust 进程内存；服务重启后自动清除。</span></div>
+              {connection.error && <div className="connection-error">{connection.error}</div>}
+              <button className="credential-submit" type="submit" disabled={loading}>{loading ? <RefreshCw className="spin" size={15} /> : <KeyRound size={15} />}{connection.connected ? '更换并验证凭证' : '验证并连接'}</button>
             </form>
-            {oauthStatus.authorization_url && <div className="oauth-status"><span>授权页面已准备好</span><a className="oauth-link" href={oauthStatus.authorization_url} target="_blank" rel="noreferrer">打开授权页面</a></div>}
-            {oauthStatus.status === 'pending' && <div className="oauth-status muted">完成授权后此窗口会自动验证连接；不要关闭本地服务。</div>}
-            {oauthStatus.status === 'connected' && <div className="oauth-status success">OAuth 已连接，可开始实时会话。</div>}
-            {oauthStatus.status === 'error' && oauthStatus.error && <div className="oauth-status failure">{oauthStatus.error}</div>}
-          </section>
-          <form className="credential-form" onSubmit={submitCredentials} autoComplete="off">
-            <label htmlFor="lb-app-key"><span>App Key</span><input id="lb-app-key" type="password" autoComplete="new-password" value={credentials.app_key} onChange={(event) => setCredentials((current) => ({ ...current, app_key: event.target.value }))} /></label>
-            <label htmlFor="lb-app-secret"><span>App Secret</span><input id="lb-app-secret" type="password" autoComplete="new-password" value={credentials.app_secret} onChange={(event) => setCredentials((current) => ({ ...current, app_secret: event.target.value }))} /></label>
-            <label htmlFor="lb-access-token"><span>Access Token</span><textarea id="lb-access-token" rows="4" autoComplete="off" value={credentials.access_token} onChange={(event) => setCredentials((current) => ({ ...current, access_token: event.target.value }))} /></label>
-            <div className="credential-security"><LockKeyhole size={15} /><span>凭证通过同源接口传给 Rust 后端，仅驻留当前进程内存；刷新页面不会回填，服务重启后自动清除。</span></div>
-            {connection.error && <div className="connection-error">{connection.error}</div>}
-            <button className="credential-submit" type="submit" disabled={loading}>{loading ? <RefreshCw className="spin" size={15} /> : <KeyRound size={15} />}{connection.connected ? '更换并验证凭证' : '验证并连接'}</button>
-          </form>
-          <div className="package-section"><span>行情权限包</span><div>{connection.packages?.length ? connection.packages.map((item) => <b key={item}>{item}</b>) : <small>连接后读取；美股期权实时行情需要相应 OPRA 权限。</small>}</div></div>
-          {connection.connected && <button className="disconnect-button" onClick={disconnectLongbridge}><WifiOff size={14} />断开并清除凭证</button>}
+            <div className="package-section"><span>行情权限包</span><div>{connection.packages?.length ? connection.packages.map((item) => <b key={item}>{item}</b>) : <small>美股期权实时行情需要相应 OPRA 权限。</small>}</div></div>
+            {connection.connected && <button className="disconnect-button" onClick={disconnectLongbridge}><WifiOff size={14} />断开并清除凭证</button>}
+          </> : <>
+            <form className="credential-form theta-credential-form" onSubmit={submitThetaCredentials} autoComplete="off">
+              <label htmlFor="theta-email"><span>Email</span><input id="theta-email" type="email" autoComplete="off" value={thetaCredentials.email} onChange={(event) => setThetaCredentials((current) => ({ ...current, email: event.target.value }))} /></label>
+              <label htmlFor="theta-password"><span>Password</span><input id="theta-password" type="password" autoComplete="new-password" value={thetaCredentials.password} onChange={(event) => setThetaCredentials((current) => ({ ...current, password: event.target.value }))} /></label>
+              <div className="credential-security"><LockKeyhole size={15} /><span>凭证经 Rust 传入本地单会话适配器，仅驻留进程内存；不会写入浏览器、审计账本或仓库。</span></div>
+              {thetaConnection.error && <div className="connection-error">{thetaConnection.error}</div>}
+              <div className="credential-actions"><button className="credential-submit" type="submit" disabled={loading}>{loading ? <RefreshCw className="spin" size={15} /> : <KeyRound size={15} />}{thetaConnection.connected ? '更换并验证凭证' : '验证并连接'}</button><button className="environment-credential" type="button" disabled={loading} onClick={(event) => submitThetaCredentials(event, true)}>使用服务端环境凭证</button></div>
+            </form>
+            <div className="package-section"><span>订阅档位</span><div>{thetaConnection.packages?.length ? thetaConnection.packages.map((item) => <b key={item}>{item}</b>) : <small>连接后由 ThetaData SDK 返回股票与期权权限。</small>}</div></div>
+            <div className="provider-boundary"><Radio size={14} /><span>实时截面按配置周期轮询；所有 IV、Greeks、SVI 与 Exposure 继续由 Rust 计算。ThetaData 模式不开放券商下单。</span></div>
+            {thetaConnection.connected && <button className="disconnect-button" onClick={disconnectThetaData}><WifiOff size={14} />断开并清除凭证</button>}
+          </>}
         </aside>
       </div>}
       {paperConfirmOpen && <div className="paper-confirm-backdrop" onMouseDown={() => setPaperConfirmOpen(false)}>

@@ -269,6 +269,32 @@ pub struct CredentialRequest {
     pub access_token: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct ThetaCredentialRequest {
+    #[serde(default)]
+    pub email: String,
+    #[serde(default)]
+    pub password: String,
+}
+
+impl ThetaCredentialRequest {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let has_email = !self.email.trim().is_empty();
+        let has_password = !self.password.is_empty();
+        if has_email != has_password {
+            return Err("ThetaData 邮箱和密码必须同时填写，或同时留空使用服务端环境凭证");
+        }
+        if self.email.len() > 320 || self.password.len() > 1_024 {
+            return Err("ThetaData 凭证字段长度异常");
+        }
+        Ok(())
+    }
+
+    pub fn uses_inline_credentials(&self) -> bool {
+        !self.email.trim().is_empty()
+    }
+}
+
 impl CredentialRequest {
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.app_key.trim().is_empty()
@@ -330,6 +356,7 @@ impl Default for OAuthStatus {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ConnectionStatus {
+    pub provider: String,
     pub connected: bool,
     pub state: String,
     pub auth_method: String,
@@ -357,6 +384,7 @@ pub struct ConnectionStatus {
 impl Default for ConnectionStatus {
     fn default() -> Self {
         Self {
+            provider: "longbridge".into(),
             connected: false,
             state: "disconnected".into(),
             auth_method: "none".into(),
@@ -385,6 +413,8 @@ impl Default for ConnectionStatus {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct LiveSessionRequest {
+    #[serde(default = "default_live_provider")]
+    pub provider: String,
     pub symbol: String,
     pub expiration: Option<String>,
     #[serde(default = "default_contract_limit")]
@@ -397,6 +427,10 @@ pub struct LiveSessionRequest {
     pub pricing_mode: String,
     #[serde(default = "default_dealer_model")]
     pub dealer_model: String,
+}
+
+fn default_live_provider() -> String {
+    "longbridge".into()
 }
 
 fn default_contract_limit() -> usize {
@@ -417,9 +451,9 @@ fn default_dealer_model() -> String {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LiveFeedInfo {
-    pub source: &'static str,
-    pub transport: &'static str,
-    pub sdk_version: &'static str,
+    pub source: String,
+    pub transport: String,
+    pub sdk_version: String,
     pub symbol: String,
     pub expiration: String,
     pub expirations: Vec<String>,
@@ -448,7 +482,7 @@ pub struct LiveSnapshot {
 
 #[cfg(test)]
 mod tests {
-    use super::{OAuthStartRequest, OAuthStatus};
+    use super::{OAuthStartRequest, OAuthStatus, ThetaCredentialRequest};
 
     #[test]
     fn oauth_client_id_validation_accepts_provider_ids() {
@@ -484,5 +518,25 @@ mod tests {
         let json = serde_json::to_value(OAuthStatus::default()).unwrap();
         assert!(json.get("access_token").is_none());
         assert_eq!(json["status"], "idle");
+    }
+
+    #[test]
+    fn theta_credentials_allow_environment_mode_and_require_complete_inline_pair() {
+        assert!(
+            ThetaCredentialRequest {
+                email: String::new(),
+                password: String::new(),
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            ThetaCredentialRequest {
+                email: "research@example.com".into(),
+                password: String::new(),
+            }
+            .validate()
+            .is_err()
+        );
     }
 }

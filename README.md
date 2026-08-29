@@ -7,7 +7,7 @@
 [![Vite](https://img.shields.io/badge/Vite-7-646cff?logo=vite&logoColor=white)](frontend/package.json)
 [![ECharts](https://img.shields.io/badge/ECharts-6-aa344d)](frontend/package.json)
 [![Longbridge](https://img.shields.io/badge/Longbridge-Rust%20SDK-00b386)](docs/DATA_SOURCES.md)
-[![ThetaData](https://img.shields.io/badge/ThetaData-Parquet-4b5563)](docs/DATA_SOURCES.md)
+[![ThetaData](https://img.shields.io/badge/ThetaData-Replay%20%2B%20Live-4b5563)](docs/DATA_SOURCES.md)
 [![Docker](https://img.shields.io/badge/Docker-ready-2496ed?logo=docker&logoColor=white)](Dockerfile)
 [![License](https://img.shields.io/badge/License-Apache--2.0-blue)](LICENSE)
 
@@ -35,7 +35,8 @@
 Option Workstation 刻意把这些层次拆开并显示出来：
 
 - 历史模式直接读取本地 ThetaData Parquet 分区，按时间点回放；
-- 实时模式使用 Longbridge 官方 Rust SDK，并显示行情新鲜度；
+- 实时模式可选择 Longbridge 官方 Rust SDK 流式行情，或 ThetaData 官方 Python
+  SDK 快照轮询，并显示行情新鲜度与传输方式；
 - Bid/Ask 可用性、报价年龄和 OI 元数据覆盖率不会被隐藏；
 - BSM、SVI、Greeks、GEX、波动率上下文和曲面由 Rust 服务统一计算；
 - 组合分析按可执行 NBBO 边计价，而不是只展示理想化中间价；
@@ -52,7 +53,7 @@ Option Workstation 刻意把这些层次拆开并显示出来：
 | 模块 | 当前能力 | 必须知道的边界 |
 | --- | --- | --- |
 | 历史回放 | 多标的分钟线、期权链、到期日与同步步进 | 需要用户自行取得合法授权的数据 |
-| 实时分析 | Longbridge 行情/深度订阅与本地 WebSocket | 受账号权限和供应商限频约束 |
+| 实时分析 | Longbridge 推送或 ThetaData 快照轮询，统一为本地 WebSocket | 受账号权限、套餐与供应商限频约束 |
 | 波动率 | BSM IV/Greeks、同 DTE IV 历史、RV、VRP、Expected Move | BSM 对美式期权只是近似 |
 | 微笑与曲面 | Call/Put 微笑、SVI、残差、期限结构和约束曲面 | 研究投影，不是严格无套利证明 |
 | 暴露 | GEX、Vanna、Charm、墙位与 Gamma Flip | Dealer 符号是模型假设 |
@@ -161,12 +162,12 @@ Dealer Exposure 描述的是在给定持仓假设下潜在的对冲机制，不�
 
 | 项目 | 历史回放 | 实时工作台 |
 | --- | --- | --- |
-| 数据来源 | 本地 ThetaData 风格 Parquet 分区 | Longbridge Rust SDK 行情与深度订阅 |
-| 时间控制 | 手动逐帧、暂停、加速、回到开盘 | 随实时推送更新 |
+| 数据来源 | 本地 ThetaData 风格 Parquet 分区 | Longbridge Rust SDK 推送，或 ThetaData SDK 快照轮询 |
+| 时间控制 | 手动逐帧、暂停、加速、回到开盘 | 随推送或定时快照更新 |
 | 标的范围 | 可加入多个已有数据的标的 | 一次维护一个活动标的及受限合约池 |
 | 主要用途 | 学习、验证假设、事件复盘、策略研究 | 盘中观察、风险预览、纸面决策 |
-| 交易能力 | 永远不提交订单 | 仅在全部门禁通过时允许模拟账户限价单 |
-| 关键限制 | 依赖本地数据覆盖与 point-in-time 完整性 | 依赖账号权限、OPRA 权限、限频和网络质量 |
+| 交易能力 | 永远不提交订单 | 仅 Longbridge 定价且全部门禁通过时允许模拟账户限价单 |
+| 关键限制 | 依赖本地数据覆盖与 point-in-time 完整性 | 依赖账号权限、行情套餐、限频和网络质量 |
 
 ## 工作台如何辅助交易决策
 
@@ -212,7 +213,7 @@ flowchart LR
 
 ### 实时观察
 
-1. 连接 Longbridge 后先确认行情权限、Streaming 状态、延迟和报价覆盖。
+1. 选择 Longbridge 或 ThetaData，连接后先确认权限、传输状态、延迟和报价覆盖。
 2. 观察标的路径和成交量，再读取 IV、偏斜、期限结构及 Dealer 情景。
 3. 从镜像期权链构造少量候选组合，用可执行报价淘汰成本或滑点不合理的结构。
 4. 核对最大损失、情景矩阵和失效条件，保存研究快照。
@@ -223,6 +224,7 @@ flowchart LR
 ```mermaid
 flowchart LR
   T["ThetaData Parquet<br/>历史逐帧回放"] --> R["Rust 分析服务"]
+  TS["ThetaData Python SDK<br/>实时快照轮询"] --> R
   L["Longbridge Rust SDK<br/>实时行情与模拟账户"] --> R
   R --> B["BSM / Greeks / SVI"]
   R --> X["曲面 / GEX / 波动率上下文"]
@@ -264,9 +266,9 @@ flowchart LR
 
 - Rust stable，并安装 `rustfmt` 与 `clippy`
 - Node.js 22 与 npm
-- Python 3.11+，仅在运行旧 Python 对照测试时需要
+- Python 3.12+，ThetaData 实时源或旧 Python 对照测试需要
 - 历史模式需要用户自行准备合法授权的回放数据
-- 实时模式可选 Longbridge OpenAPI 凭证
+- 实时模式可选 Longbridge OpenAPI 或 ThetaData 凭证
 
 ```bash
 git clone <你的仓库或 fork 地址> OptionWorkstation
@@ -323,14 +325,25 @@ data/
 ## 实时连接
 
 1. 进入工作台并切换到“实时”。
-2. 打开连接面板，优先使用 **Longbridge OAuth 2.0**：输入已经注册的 OAuth Client ID，点击开始授权，在浏览器中完成 Longbridge 授权，再回到工作台等待连接状态变为已连接。
-3. 如果当前应用没有 OAuth Client ID，也可以使用兼容模式，填入 Longbridge App Key、App Secret 和 Access Token。
-4. 连接后选择标的与到期日，等待质量门禁通过。
+2. 在顶部或连接面板选择 **Longbridge** 或 **ThetaData**。
+3. Longbridge 首推 OAuth 2.0；也可使用 App Key、App Secret 与 Access Token。
+4. ThetaData 首次使用先运行 `./scripts/setup-thetadata.sh`，再在面板输入邮箱与密码；
+   也可让服务从 `THETADATA_EMAIL`、`THETADATA_PASSWORD` 或官方凭证文件读取。
+5. 连接后选择标的与到期日，等待质量门禁通过。
+
+ThetaData 官方 Python SDK 当前提供请求式快照而非 WebSocket 推送。工作台保持单一 SDK
+会话，默认每 5 秒串行抓取期权报价，把标准化结果通过本地 WebSocket 推给浏览器；OI
+使用较慢缓存以控制请求量。BSM、IV、Greeks、SVI、GEX、曲面与策略风险仍全部由 Rust
+计算。轮询间隔可调，但更短间隔会增加套餐配额、网络与 CPU 压力。
 
 OAuth 回调默认监听本机 `127.0.0.1:60355`。两种认证方式都只把凭证交给同源 Rust API，
 由 Longbridge SDK Context 保存在进程内存中；OAuth Token 不会返回浏览器、写进
 localStorage、提交到审计记录、写入默认 Token 文件或保存到仓库。断开连接或停止进程
 后，内存会话即被清除。
+
+ThetaData 邮箱、密码同样只送到本机 Rust API，再通过子进程标准输入交给 SDK；不会返回
+浏览器、写入 localStorage、日志、审计账本或仓库。ThetaData 在本项目中是纯行情源，
+使用其报价生成的策略预览不会获得模拟下单资格。
 
 OAuth 是 Longbridge 的**提供商授权方式**，不是本项目的多用户登录系统。服务仍然默认
 只监听本机回环地址，不要把本服务直接暴露到公网。
@@ -361,6 +374,11 @@ OAuth 是 Longbridge 的**提供商授权方式**，不是本项目的多用户�
 | `OPTION_WORKSTATION_RISK_FREE_RATE` | `0.043` | BSM 无风险利率 |
 | `OPTION_WORKSTATION_FRONTEND_DIST` | `./frontend/dist` | 前端构建目录 |
 | `OPTION_WORKSTATION_AUDIT_PATH` | `~/.option-workstation/audit.jsonl` | 追加式审计记录 |
+| `OPTION_WORKSTATION_THETADATA_PYTHON` | `.venv-thetadata/bin/python` 或 `python3` | ThetaData SDK 适配器 Python |
+| `OPTION_WORKSTATION_THETADATA_POLL_SECONDS` | `5` | ThetaData 快照轮询秒数，限制为 2-60 |
+| `OPTION_WORKSTATION_THETADATA_STALE_AFTER_MS` | `15000` | ThetaData 报价陈旧阈值 |
+| `THETADATA_EMAIL` / `THETADATA_PASSWORD` | 未设置 | 可选的服务端 ThetaData 进程环境凭证 |
+| `THETADATA_CREDENTIALS_FILE` | 未设置 | 可选的官方 SDK 凭证文件路径 |
 | `OPTION_WORKSTATION_LLM_API_KEY` | 未设置 | OpenAI-compatible 服务端密钥 |
 | `OPTION_WORKSTATION_LLM_MODEL` | 未设置 | 助手模型名；与 Key 同时设置才启用 |
 | `OPTION_WORKSTATION_LLM_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible API 根地址 |
@@ -383,6 +401,7 @@ OAuth 是 Longbridge 的**提供商授权方式**，不是本项目的多用户�
 | `/api/chain` | `GET` | 获取历史期权链、指标与质量门禁 |
 | `/api/surface` | `GET` | 获取约束曲面及可信度报告 |
 | `/api/volatility-context` | `GET` | 获取 point-in-time IV/RV/VRP/Expected Move |
+| `/api/thetadata/connection` | `GET`, `POST`, `DELETE` | 查询、建立或断开 ThetaData 进程内会话 |
 | `/api/live/session` | `POST`, `DELETE` | 配置或断开实时 SDK 会话 |
 | `/api/live/snapshot` | `GET` | 获取当前标准化实时快照 |
 | `/api/live/stream` | `WS` | 接收节流后的实时快照流 |
