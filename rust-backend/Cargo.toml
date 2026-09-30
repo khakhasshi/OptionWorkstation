@@ -20,6 +20,7 @@ hex = "0.4"
 longbridge = "4.4.1"
 moka = { version = "0.12", features = ["sync"] }
 parquet = { version = "59.1", default-features = false, features = ["arrow", "snap", "zstd"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rust_decimal = "1.39"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -27,7 +28,7 @@ sha2 = "0.10"
 statrs = "0.18"
 thiserror = "2.0"
 time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
-tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.47", features = ["io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

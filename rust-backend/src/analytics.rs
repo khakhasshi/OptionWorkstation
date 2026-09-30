@@ -250,29 +250,29 @@ pub fn fit_svi(rows: &[ChainRow], years: f64, forward: f64) -> Option<SviFit> {
     if samples.len() < MIN_SVI_SAMPLES {
         return None;
     }
+    let weight_sum: f64 = samples.iter().map(|sample| sample.2).sum();
+    let low = samples
+        .iter()
+        .map(|sample| sample.0)
+        .fold(f64::INFINITY, f64::min);
+    let high = samples
+        .iter()
+        .map(|sample| sample.0)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let density_grid: [f64; 21] =
+        std::array::from_fn(|index| low + (high - low) * index as f64 / 20.0);
     let objective = |params: &[f64; 5]| -> f64 {
         if !valid_svi(params) {
             return f64::INFINITY;
         }
-        let weight_sum: f64 = samples.iter().map(|sample| sample.2).sum();
         let fit_error: f64 = samples
             .iter()
             .map(|(k, variance, weight)| weight * (svi_value(*k, params) - variance).powi(2))
             .sum::<f64>()
             / weight_sum;
-        let low = samples
+        let density_penalty: f64 = density_grid
             .iter()
-            .map(|sample| sample.0)
-            .fold(f64::INFINITY, f64::min);
-        let high = samples
-            .iter()
-            .map(|sample| sample.0)
-            .fold(f64::NEG_INFINITY, f64::max);
-        let density_penalty: f64 = (0..21)
-            .map(|index| {
-                let k = low + (high - low) * index as f64 / 20.0;
-                svi_density(k, params).min(0.0).powi(2)
-            })
+            .map(|k| svi_density(*k, params).min(0.0).powi(2))
             .sum();
         fit_error + density_penalty * 100.0
     };
@@ -299,16 +299,8 @@ pub fn fit_svi(rows: &[ChainRow], years: f64, forward: f64) -> Option<SviFit> {
             *step *= 0.55;
         }
     }
-    let k_min = samples
-        .iter()
-        .map(|sample| sample.0)
-        .fold(f64::INFINITY, f64::min)
-        .max(-0.35);
-    let k_max = samples
-        .iter()
-        .map(|sample| sample.0)
-        .fold(f64::NEG_INFINITY, f64::max)
-        .min(0.35);
+    let k_min = low.max(-0.35);
+    let k_max = high.min(0.35);
     let curve: Vec<SviPoint> = (0..61)
         .map(|index| {
             let k = k_min + (k_max - k_min) * index as f64 / 60.0;
@@ -463,63 +455,153 @@ fn infer_forward(
     Some(candidates[candidates.len() / 2])
 }
 
+fn forward_and_dividend_yield(
+    quotes: &[RawOptionQuote],
+    spot: f64,
+    years: f64,
+    rate: f64,
+    pricing_mode: &str,
+) -> (f64, f64, bool) {
+    let parity_forward = infer_forward(quotes, spot, years, rate, pricing_mode);
+    let forward = parity_forward.unwrap_or_else(|| spot * (rate * years).exp());
+    let dividend_yield = if parity_forward.is_some() && years > 0.0 {
+        (rate - (forward / spot).ln() / years).clamp(-0.5, 0.5)
+    } else {
+        0.0
+    };
+    (forward, dividend_yield, parity_forward.is_some())
+}
+
+struct QuotePricing {
+    spread_valid: bool,
+    midpoint: f64,
+    microprice: f64,
+    mark: f64,
+    solved_iv: Option<f64>,
+    iv: f64,
+}
+
+fn price_quote(
+    quote: &RawOptionQuote,
+    spot: f64,
+    years: f64,
+    pricing_mode: &str,
+    rate: f64,
+    dividend_yield: f64,
+) -> Option<QuotePricing> {
+    let spread_valid = quote.ask.is_finite()
+        && quote.bid.is_finite()
+        && quote.ask > 0.0
+        && quote.bid >= 0.0
+        && quote.ask >= quote.bid;
+    let midpoint = if spread_valid {
+        (quote.bid + quote.ask) / 2.0
+    } else {
+        quote.last.unwrap_or(0.0)
+    };
+    let microprice = if spread_valid && quote.bid_size + quote.ask_size > 0 {
+        (quote.ask * quote.bid_size as f64 + quote.bid * quote.ask_size as f64)
+            / (quote.bid_size + quote.ask_size) as f64
+    } else {
+        midpoint
+    };
+    let mark = match pricing_mode {
+        "ask" if spread_valid => quote.ask,
+        "mid" => midpoint,
+        _ => microprice,
+    };
+    let solved_iv = implied_volatility_with_carry(
+        mark,
+        spot,
+        quote.strike,
+        years,
+        &quote.right,
+        rate,
+        dividend_yield,
+    );
+    let iv = solved_iv
+        .or(quote.sdk_iv)
+        .filter(|value| (0.01..=4.0).contains(value))?;
+    Some(QuotePricing {
+        spread_valid,
+        midpoint,
+        microprice,
+        mark,
+        solved_iv,
+        iv,
+    })
+}
+
+/// The same ATM IV as a full chain, without calculating unused Greeks, SVI,
+/// exposure scenarios, or transport rows for historical volatility context.
+pub fn atm_implied_volatility(
+    spot: f64,
+    as_of: DateTime<Utc>,
+    expiration: NaiveDate,
+    quotes: &[RawOptionQuote],
+    pricing_mode: &str,
+    rate: f64,
+) -> anyhow::Result<f64> {
+    anyhow::ensure!(spot.is_finite() && spot > 0.0, "invalid underlying spot");
+    let years = years_to_expiry(as_of, expiration);
+    let (forward, dividend_yield, _) =
+        forward_and_dividend_yield(quotes, spot, years, rate, pricing_mode);
+    let mut candidates: Vec<_> = quotes
+        .iter()
+        .map(|quote| (round((quote.strike / forward).ln(), 6).abs(), quote))
+        .collect();
+    // A full chain stably sorts rows by strike/right, then min_by selects the
+    // first minimum rounded log-moneyness. Preserve that ordering, including
+    // CALL/PUT ties and duplicate contracts, while solving only usable candidates.
+    candidates.sort_by(|(left_distance, left), (right_distance, right)| {
+        left_distance
+            .total_cmp(right_distance)
+            .then_with(|| left.strike.total_cmp(&right.strike))
+            .then_with(|| left.right.cmp(&right.right))
+    });
+    candidates
+        .into_iter()
+        .find_map(|(_, quote)| {
+            price_quote(quote, spot, years, pricing_mode, rate, dividend_yield)
+                .map(|pricing| round(pricing.iv * 100.0, 3))
+        })
+        .ok_or_else(|| anyhow::anyhow!("no usable option quotes"))
+}
+
 pub fn build_chain(input: ChainBuild<'_>) -> anyhow::Result<ChainSnapshot> {
     anyhow::ensure!(
         input.spot.is_finite() && input.spot > 0.0,
         "invalid underlying spot"
     );
     let years = years_to_expiry(input.as_of, input.expiration);
-    let parity_forward = infer_forward(
+    let (forward, dividend_yield, forward_from_parity) = forward_and_dividend_yield(
         input.quotes,
         input.spot,
         years,
         input.risk_free_rate,
         input.pricing_mode,
     );
-    let forward =
-        parity_forward.unwrap_or_else(|| input.spot * (input.risk_free_rate * years).exp());
-    let dividend_yield = if parity_forward.is_some() && years > 0.0 {
-        (input.risk_free_rate - (forward / input.spot).ln() / years).clamp(-0.5, 0.5)
-    } else {
-        0.0
-    };
     let gex_ready = input.metadata_coverage >= 90.0;
     let mut rows = Vec::with_capacity(input.quotes.len());
     for quote in input.quotes {
-        let spread_valid = quote.ask.is_finite()
-            && quote.bid.is_finite()
-            && quote.ask > 0.0
-            && quote.bid >= 0.0
-            && quote.ask >= quote.bid;
-        let midpoint = if spread_valid {
-            (quote.bid + quote.ask) / 2.0
-        } else {
-            quote.last.unwrap_or(0.0)
-        };
-        let microprice = if spread_valid && quote.bid_size + quote.ask_size > 0 {
-            (quote.ask * quote.bid_size as f64 + quote.bid * quote.ask_size as f64)
-                / (quote.bid_size + quote.ask_size) as f64
-        } else {
-            midpoint
-        };
-        let mark = match input.pricing_mode {
-            "ask" if spread_valid => quote.ask,
-            "mid" => midpoint,
-            _ => microprice,
-        };
-        let solved_iv = implied_volatility_with_carry(
+        let Some(QuotePricing {
+            spread_valid,
+            midpoint,
+            microprice,
             mark,
+            solved_iv,
+            iv,
+        }) = price_quote(
+            quote,
             input.spot,
-            quote.strike,
             years,
-            &quote.right,
+            input.pricing_mode,
             input.risk_free_rate,
             dividend_yield,
-        );
-        let iv = solved_iv
-            .or(quote.sdk_iv)
-            .filter(|value| (0.01..=4.0).contains(value));
-        let Some(iv) = iv else { continue };
+        )
+        else {
+            continue;
+        };
         let calculated = greeks(
             input.spot,
             quote.strike,
@@ -791,7 +873,7 @@ pub fn build_chain(input: ChainBuild<'_>) -> anyhow::Result<ChainSnapshot> {
             oi_frequency: input.oi_frequency.to_string(),
             risk_free_rate: input.risk_free_rate,
             dividend_yield: round(dividend_yield, 6),
-            forward_source: if parity_forward.is_some() {
+            forward_source: if forward_from_parity {
                 "put_call_parity"
             } else {
                 "cost_of_carry_fallback"
@@ -1156,6 +1238,187 @@ mod tests {
     use chrono::TimeZone;
 
     use super::*;
+
+    fn atm_test_quote(strike: f64, right: &str, bid: f64, ask: f64) -> RawOptionQuote {
+        RawOptionQuote {
+            symbol: format!("TEST-{strike}-{right}"),
+            strike,
+            right: right.into(),
+            bid_size: 7,
+            ask_size: 13,
+            bid,
+            ask,
+            last: None,
+            volume: 0,
+            open_interest: 100,
+            sdk_iv: None,
+            sdk_delta: None,
+            sdk_gamma: None,
+            sdk_theta: None,
+            sdk_vega: None,
+        }
+    }
+
+    fn assert_atm_matches_chain(
+        quotes: &[RawOptionQuote],
+        as_of: DateTime<Utc>,
+        expiration: NaiveDate,
+        pricing_mode: &str,
+        rate: f64,
+    ) -> Option<f64> {
+        let full = build_chain(ChainBuild {
+            symbol: "TEST",
+            spot: 100.0,
+            as_of,
+            expiration,
+            quotes,
+            pricing_mode,
+            dealer_model: "classic",
+            risk_free_rate: rate,
+            source: "synthetic",
+            quote_interval: "1m",
+            oi_frequency: "daily",
+            prefer_sdk_greeks: false,
+            quote_coverage: 100.0,
+            fresh_quote_coverage: 100.0,
+            metadata_coverage: 100.0,
+            spot_age_ms: Some(0),
+        });
+        let atm = atm_implied_volatility(100.0, as_of, expiration, quotes, pricing_mode, rate);
+        match full {
+            Ok(chain) => {
+                let actual = Some(atm.expect("full chain had a usable ATM quote"));
+                assert_eq!(actual, chain.metrics.atm_iv, "pricing_mode={pricing_mode}");
+                actual
+            }
+            Err(_) => {
+                assert!(atm.is_err(), "ATM-only must reject an unusable full chain");
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn historical_atm_matches_full_chain_across_pricing_and_quote_quality() {
+        let as_of = Utc.with_ymd_and_hms(2026, 7, 10, 14, 30, 0).unwrap();
+        let expiration = NaiveDate::from_ymd_opt(2026, 8, 14).unwrap();
+        let years = years_to_expiry(as_of, expiration);
+        let quotes: Vec<_> = (70..=130)
+            .step_by(2)
+            .flat_map(|strike| {
+                ["PUT", "CALL"].map(|right| {
+                    let strike = strike as f64;
+                    let iv = 0.24 + (strike / 100.0).ln().abs() * 0.1;
+                    let mid = option_value(100.0, strike, years, iv, right, 0.043, 0.015);
+                    atm_test_quote(strike, right, (mid - 0.025).max(0.0), mid + 0.025)
+                })
+            })
+            .collect();
+        let mut shuffled = quotes.clone();
+        shuffled.reverse();
+        shuffled.rotate_left(17);
+        let mut sparse = quotes.clone();
+        for quote in &mut sparse {
+            if (quote.strike - 100.0).abs() < 3.0 {
+                quote.bid = f64::NAN;
+                quote.ask = 0.0;
+                quote.bid_size = 0;
+                quote.ask_size = 0;
+            }
+        }
+        let mut last_fallback = sparse.clone();
+        last_fallback
+            .iter_mut()
+            .find(|quote| quote.strike == 100.0)
+            .unwrap()
+            .last = Some(2.5);
+        let mut sdk_fallback = sparse.clone();
+        sdk_fallback
+            .iter_mut()
+            .find(|quote| quote.strike == 100.0)
+            .unwrap()
+            .sdk_iv = Some(0.314159);
+        for candidate in [&quotes, &shuffled, &sparse, &last_fallback, &sdk_fallback] {
+            for mode in ["mid", "micro", "ask"] {
+                assert!(
+                    assert_atm_matches_chain(candidate, as_of, expiration, mode, 0.043).is_some()
+                );
+            }
+        }
+        // At 0DTE inside the SVI guard, ATM still follows exactly the same
+        // quote/IV validity rules and does not depend on fitting a smile.
+        let near_close = Utc.with_ymd_and_hms(2026, 7, 10, 19, 59, 0).unwrap();
+        assert!(
+            assert_atm_matches_chain(&sdk_fallback, near_close, as_of.date_naive(), "mid", 0.043)
+                .is_some()
+        );
+        assert!(assert_atm_matches_chain(&[], as_of, expiration, "mid", 0.043).is_none());
+        assert!(
+            atm_implied_volatility(f64::NAN, as_of, expiration, &quotes, "mid", 0.043).is_err()
+        );
+    }
+
+    #[test]
+    fn historical_atm_preserves_rounded_ties_duplicate_order_and_sdk_filtering() {
+        let as_of = Utc.with_ymd_and_hms(2026, 7, 10, 14, 30, 0).unwrap();
+        let expiration = NaiveDate::from_ymd_opt(2026, 8, 14).unwrap();
+        let fallback = |strike, right: &str, iv| {
+            let mut quote = atm_test_quote(strike, right, 0.0, 0.0);
+            quote.sdk_iv = Some(iv);
+            quote
+        };
+        let mut duplicates = vec![
+            fallback(100.0, "PUT", 0.42),
+            fallback(100.0, "CALL", 0.31),
+            fallback(100.0, "CALL", 0.47),
+        ];
+        assert_eq!(
+            assert_atm_matches_chain(&duplicates, as_of, expiration, "mid", 0.0),
+            Some(31.0)
+        );
+        duplicates.reverse();
+        assert_eq!(
+            assert_atm_matches_chain(&duplicates, as_of, expiration, "mid", 0.0),
+            Some(47.0)
+        );
+        let rounded_tie = vec![
+            fallback(100.00004, "CALL", 0.22),
+            fallback(99.99996, "CALL", 0.11),
+        ];
+        assert_eq!(
+            assert_atm_matches_chain(&rounded_tie, as_of, expiration, "mid", 0.0),
+            Some(11.0)
+        );
+
+        let price = option_value(
+            100.0,
+            100.0,
+            years_to_expiry(as_of, expiration),
+            4.5,
+            "CALL",
+            0.0,
+            0.0,
+        );
+        let mut rejected = atm_test_quote(100.0, "CALL", price, price);
+        rejected.sdk_iv = Some(0.2);
+        // A solved but out-of-range IV is rejected before any SDK rescue: the
+        // original contract is solved_iv.or(sdk_iv).filter(valid_range).
+        let out_of_range = vec![rejected, fallback(101.0, "CALL", 0.33)];
+        assert_eq!(
+            assert_atm_matches_chain(&out_of_range, as_of, expiration, "mid", 0.0),
+            Some(33.0)
+        );
+        assert!(
+            assert_atm_matches_chain(
+                &[fallback(100.0, "CALL", 4.5)],
+                as_of,
+                expiration,
+                "mid",
+                0.0
+            )
+            .is_none()
+        );
+    }
 
     fn svi_row(strike: f64, right: &str) -> ChainRow {
         let moneyness = strike / 100.0;

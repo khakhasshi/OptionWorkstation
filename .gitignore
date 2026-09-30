@@ -43,6 +43,7 @@ frontend/.vite/
 **/__pycache__/
 *.py[cod]
 .venv/
+.venv-thetadata/
 venv/
 
 # Coverage and temporary files

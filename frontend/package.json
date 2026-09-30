@@ -5,6 +5,7 @@
   "description": "Research-first options replay and live analytics workstation",
   "type": "module",
   "scripts": {
+    "test": "node --test src/lib/*.test.js",
     "dev": "vite --host 0.0.0.0 --port 7310",
     "build": "vite build",
     "preview": "vite preview --host 0.0.0.0 --port 7310"
@@ -14,11 +15,13 @@
     "echarts-gl": "^2.0.9",
     "lucide-react": "^0.468.0",
     "react": "^19.2.8",
-    "react-dom": "^19.2.8"
+    "react-dom": "^19.2.8",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^5.0.0",
-    "vite": "^7.0.0",
-    "puppeteer-core": "^25.4.0"
+    "puppeteer-core": "^25.4.0",
+    "vite": "^7.0.0"
   }
 }

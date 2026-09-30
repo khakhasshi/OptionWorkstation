@@ -4,7 +4,7 @@
 
 - Rust stable, edition 2024
 - Node.js 22
-- Python 3.11+ for legacy parity only
+- Python 3.12+ for the optional ThetaData adapter and legacy parity
 - Chromium or Chrome for browser smoke tests
 
 Use the committed Cargo and npm lockfiles. Dependency changes must update the
@@ -19,6 +19,17 @@ make setup
 
 The default data root is `./data`, which is ignored by Git. The application can
 start without it.
+
+For ThetaData live-mode development, install its isolated SDK environment:
+
+```bash
+./scripts/setup-thetadata.sh
+```
+
+The Rust service discovers `.venv-thetadata/bin/python` automatically. Override
+it with `OPTION_WORKSTATION_THETADATA_PYTHON` when reusing another environment.
+Credentials may be submitted through the loopback UI or read from an ignored,
+mode-`600` `.env`; never add them to fixtures or test output.
 
 ## Run
 
@@ -54,6 +65,20 @@ cargo test --locked --manifest-path rust-backend/Cargo.toml
 These cover model calculations, safety gates, redaction, and point-in-time
 helpers without provider data.
 
+### Frontend Behavior Tests
+
+```bash
+cd frontend
+npm test
+```
+
+These use a controlled clock and deferred responses to exercise fast playback,
+slow requests, cancellation, and snapshot consistency without licensed data or
+provider credentials. The same suite covers chart scheduling (hidden updates,
+resize coalescing, disposal and stable event handlers), chain windowing and
+keyboard scroll targets, surface ranges, and exposure conventions. They also
+run in CI and `make check`.
+
 ### Legacy Python Tests
 
 ```bash
@@ -66,6 +91,17 @@ python -m pytest -q
 The no-data smoke test always runs. Licensed ThetaData parity tests skip unless
 `OPTION_WORKSTATION_DATA_ROOT` points to the expected fixture.
 
+### ThetaData Adapter Tests
+
+```bash
+python3 -m pytest -q tests/test_thetadata_adapter.py
+```
+
+These tests use a fake SDK and verify protocol normalization and invalid-session
+recovery without credentials or network access. A live provider smoke test is
+manual and must report only redacted counts, timestamps, quality, and source
+metadata. Do not record raw licensed rows.
+
 ### Browser Tests
 
 Start the server, then:
@@ -73,12 +109,29 @@ Start the server, then:
 ```bash
 RUN_BROWSER_SMOKE=1 ./scripts/verify.sh http://127.0.0.1:7311
 node scripts/guide-smoke.mjs http://127.0.0.1:7311
+node scripts/assistant-browser-smoke.mjs http://127.0.0.1:7311
+```
+
+Start the Rust service with `OPTION_WORKSTATION_LLM_MOCK=1` before the assistant
+checks. To resolve a full frozen context for every replay symbol, verify
+two-context comparison, favorite it, and restore it without a trading call:
+
+```bash
+node scripts/assistant-smoke.mjs http://127.0.0.1:7311
 ```
 
 Live switching additionally requires an in-memory Longbridge paper session:
 
 ```bash
 node scripts/live-switch-smoke.mjs http://127.0.0.1:7311
+```
+
+ThetaData live switching can be exercised from the same workstation after its
+connection status is ready. It must never invoke an order endpoint; the server
+also rejects ThetaData-priced paper submissions independently of the browser.
+
+```bash
+RUN_THETADATA_LIVE_SMOKE=1 ./scripts/verify.sh http://127.0.0.1:7311
 ```
 
 Browser automation must never call order mutation routes.
@@ -95,6 +148,7 @@ The gate includes:
 - `cargo fmt --check`;
 - `cargo test --locked`;
 - `cargo clippy --locked --all-targets -- -D warnings`;
+- deterministic frontend replay tests;
 - frontend production build;
 - running-server API smoke checks when available;
 - private path, market-data, oversized artifact, and secret scans.
@@ -132,3 +186,36 @@ Benchmark before and after. Keep separate measurements for:
 
 Do not trade away freshness or quality checks for headline latency without
 showing the behavioral effect.
+
+For end-to-end replay comparisons, preserve the baseline release binary before
+editing, then run the same licensed dataset against both builds:
+
+```bash
+mkdir -p artifacts/performance
+cargo build --locked --release --manifest-path rust-backend/Cargo.toml
+cp rust-backend/target/release/option-workstation artifacts/performance/baseline-server
+python3 scripts/benchmark-replay.py \
+  --binary artifacts/performance/baseline-server \
+  --data-root "$OPTION_WORKSTATION_DATA_ROOT" \
+  --date 2026-07-10 --expiration 2026-07-17 \
+  --output artifacts/performance/before
+
+# After editing and rebuilding the release binary:
+python3 scripts/benchmark-replay.py \
+  --binary rust-backend/target/release/option-workstation \
+  --data-root "$OPTION_WORKSTATION_DATA_ROOT" \
+  --date 2026-07-10 --expiration 2026-07-17 \
+  --output artifacts/performance/after --compare artifacts/performance/before
+```
+
+Choose dates and expirations available in your dataset. Use `--symbol`,
+`--minutes`, `--pricing-mode`, `--dealer-model`, and `--max-dte` for other
+scenarios. Each invocation starts and stops an isolated loopback server with
+fresh application caches and no provider credentials. It measures five new
+minutes, five repeated frames, then individual chain/surface/volatility routes.
+OS file caches are not flushed, and HTTP timings include serialization and
+transfer; these are not individual kernel timings or browser frame rates.
+Run comparisons sequentially without competing builds. Complete responses and
+reports stay in ignored `artifacts/`; never commit licensed rows. A comparison
+fails if any parsed JSON response differs, including analytics and quality
+metadata.

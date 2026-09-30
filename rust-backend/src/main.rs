@@ -1,12 +1,14 @@
 mod analytics;
+mod assistant;
 mod audit;
 mod live;
 mod models;
 mod replay;
 mod strategy;
+mod theta_live;
 mod volatility;
 
-use std::{env, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{convert::Infallible, env, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
@@ -15,10 +17,13 @@ use axum::{
         ws::{Message, WebSocket},
     },
     http::StatusCode,
-    response::{IntoResponse, Response},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
     routing::{get, post},
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt, stream};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tower_http::{
@@ -28,18 +33,26 @@ use tower_http::{
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
+    assistant::{
+        AssistantChatRequest, AssistantContext, AssistantContextInput, AssistantCreateRequest,
+        AssistantImportRequest, AssistantManager, AssistantSession, AssistantSnapshotRef,
+        build_context,
+    },
     audit::{AuditCaptureRequest, AuditStore},
     live::{LiveManager, option_retry_after_ms},
-    models::{CredentialRequest, LiveSessionRequest, OAuthStartRequest},
+    models::{CredentialRequest, LiveSessionRequest, OAuthStartRequest, ThetaCredentialRequest},
     replay::{ReplaySnapshotParams, ReplayStore},
     strategy::{PaperOrderRequest, StrategyRequest, analyze_strategy},
+    theta_live::ThetaLiveManager,
 };
 
 #[derive(Clone)]
 struct AppState {
     replay: Arc<ReplayStore>,
     live: Arc<LiveManager>,
+    theta: Arc<ThetaLiveManager>,
     audit: Arc<AuditStore>,
+    assistant: Arc<AssistantManager>,
 }
 
 #[derive(Debug)]
@@ -156,6 +169,32 @@ struct AuditListQuery {
     limit: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveProvider {
+    Longbridge,
+    ThetaData,
+}
+
+#[derive(Deserialize)]
+struct LiveProviderQuery {
+    #[serde(default = "default_live_provider")]
+    provider: String,
+}
+
+fn default_live_provider() -> String {
+    "longbridge".into()
+}
+
+fn parse_live_provider(value: &str) -> Result<LiveProvider, ApiError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "longbridge" => Ok(LiveProvider::Longbridge),
+        "thetadata" | "theta" => Ok(LiveProvider::ThetaData),
+        _ => Err(ApiError::bad_request(
+            "provider must be longbridge or thetadata",
+        )),
+    }
+}
+
 fn default_pricing_mode() -> String {
     "micro".into()
 }
@@ -183,6 +222,8 @@ fn validate_minute(value: &str) -> Result<(), ApiError> {
 
 async fn health(State(state): State<AppState>) -> Json<Value> {
     let connection = state.live.status().await;
+    let theta_connection = state.theta.status().await;
+    let assistant = state.assistant.status();
     Json(json!({
         "ok": state.replay.root().is_dir(),
         "engine": "rust",
@@ -190,7 +231,12 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
         "longbridge_sdk": "4.4.1",
         "data_root": state.replay.root(),
         "audit_ledger": state.audit.path(),
-        "live_connected": connection.connected,
+        "live_connected": connection.connected || theta_connection.connected,
+        "longbridge_connected": connection.connected,
+        "thetadata_connected": theta_connection.connected,
+        "thetadata_transport": "official Python SDK snapshot polling",
+        "assistant_enabled": assistant.enabled,
+        "assistant_model": assistant.model,
     }))
 }
 
@@ -331,14 +377,44 @@ async fn disconnect_longbridge(State(state): State<AppState>) -> Json<Value> {
     Json(serde_json::to_value(state.live.disconnect().await).expect("serialize connection status"))
 }
 
+async fn thetadata_connection_status(State(state): State<AppState>) -> Json<Value> {
+    Json(
+        serde_json::to_value(state.theta.status().await)
+            .expect("serialize ThetaData connection status"),
+    )
+}
+
+async fn connect_thetadata(
+    State(state): State<AppState>,
+    Json(credentials): Json<ThetaCredentialRequest>,
+) -> Result<Json<Value>, ApiError> {
+    credentials.validate().map_err(ApiError::bad_request)?;
+    state
+        .theta
+        .connect(credentials)
+        .await
+        .and_then(|value| serde_json::to_value(value).map_err(anyhow::Error::from))
+        .map(Json)
+        .map_err(ApiError::upstream)
+}
+
+async fn disconnect_thetadata(State(state): State<AppState>) -> Json<Value> {
+    Json(
+        serde_json::to_value(state.theta.disconnect().await)
+            .expect("serialize ThetaData connection status"),
+    )
+}
+
 async fn setup_live_session(
     State(state): State<AppState>,
     Json(request): Json<LiveSessionRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    state
-        .live
-        .setup_session(request)
-        .await
+    let provider = parse_live_provider(&request.provider)?;
+    let result = match provider {
+        LiveProvider::Longbridge => state.live.setup_session(request).await,
+        LiveProvider::ThetaData => state.theta.setup_session(request).await,
+    };
+    result
         .and_then(|value| serde_json::to_value(value).map_err(anyhow::Error::from))
         .map(Json)
         .map_err(|error| {
@@ -356,26 +432,47 @@ async fn setup_live_session(
         })
 }
 
-async fn live_snapshot(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    state
-        .live
-        .snapshot()
-        .await
+async fn live_snapshot(
+    State(state): State<AppState>,
+    Query(query): Query<LiveProviderQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let result = match parse_live_provider(&query.provider)? {
+        LiveProvider::Longbridge => state.live.snapshot().await,
+        LiveProvider::ThetaData => state.theta.snapshot().await,
+    };
+    result
         .and_then(|value| serde_json::to_value(value).map_err(anyhow::Error::from))
         .map(Json)
         .map_err(ApiError::conflict)
 }
 
-async fn live_volatility_context(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let snapshot = state.live.snapshot().await.map_err(ApiError::conflict)?;
-    let closes = state
-        .live
-        .daily_closes(45)
-        .await
-        .map_err(ApiError::upstream)?;
+async fn live_volatility_context(
+    State(state): State<AppState>,
+    Query(query): Query<LiveProviderQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let (snapshot, closes, rv_source) = match parse_live_provider(&query.provider)? {
+        LiveProvider::Longbridge => (
+            state.live.snapshot().await.map_err(ApiError::conflict)?,
+            state
+                .live
+                .daily_closes(45)
+                .await
+                .map_err(ApiError::upstream)?,
+            "Longbridge forward-adjusted daily closes",
+        ),
+        LiveProvider::ThetaData => (
+            state.theta.snapshot().await.map_err(ApiError::conflict)?,
+            state
+                .theta
+                .daily_closes(45)
+                .await
+                .map_err(ApiError::upstream)?,
+            "ThetaData daily closes",
+        ),
+    };
     state
         .replay
-        .live_volatility_context(&snapshot.chain, &closes)
+        .live_volatility_context(&snapshot.chain, &closes, rv_source)
         .map(Json)
         .map_err(ApiError::bad_request)
 }
@@ -385,7 +482,11 @@ async fn strategy_analyze(
     Json(request): Json<StrategyRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let chain = if request.mode == "live" {
-        let snapshot = state.live.snapshot().await.map_err(ApiError::conflict)?;
+        let snapshot = match parse_live_provider(&request.provider)? {
+            LiveProvider::Longbridge => state.live.snapshot().await,
+            LiveProvider::ThetaData => state.theta.snapshot().await,
+        }
+        .map_err(ApiError::conflict)?;
         if !request.symbol.eq_ignore_ascii_case(&snapshot.chain.symbol) {
             return Err(ApiError::conflict(
                 "live symbol changed; refresh the strategy",
@@ -465,6 +566,286 @@ async fn append_audit_record(
         .map_err(ApiError::bad_request)
 }
 
+async fn assistant_status(State(state): State<AppState>) -> Json<Value> {
+    Json(serde_json::to_value(state.assistant.status()).expect("serialize assistant status"))
+}
+
+async fn assistant_sessions(State(state): State<AppState>) -> Json<Value> {
+    Json(
+        serde_json::to_value(state.assistant.list_sessions().await)
+            .expect("serialize assistant sessions"),
+    )
+}
+
+async fn create_assistant_session(
+    State(state): State<AppState>,
+    Json(request): Json<AssistantCreateRequest>,
+) -> Json<Value> {
+    Json(
+        serde_json::to_value(state.assistant.create_session(request).await)
+            .expect("serialize assistant session"),
+    )
+}
+
+async fn get_assistant_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    state
+        .assistant
+        .get_session(&id)
+        .await
+        .and_then(|session| serde_json::to_value(session).map_err(anyhow::Error::from))
+        .map(Json)
+        .map_err(ApiError::bad_request)
+}
+
+async fn delete_assistant_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    if state.assistant.delete_session(&id).await {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::bad_request("assistant session not found"))
+    }
+}
+
+async fn resolve_assistant_context(
+    state: &AppState,
+    reference: AssistantSnapshotRef,
+    strategy: Option<Value>,
+) -> Result<AssistantContext, ApiError> {
+    match reference {
+        AssistantSnapshotRef::Replay {
+            symbol,
+            date,
+            minute,
+            expiration,
+            pricing_mode,
+            dealer_model,
+            max_dte,
+        } => {
+            validate_minute(&minute)?;
+            if !(1..=1000).contains(&max_dte) {
+                return Err(ApiError::bad_request("max_dte must be between 1 and 1000"));
+            }
+            let snapshot = state
+                .replay
+                .snapshot(ReplaySnapshotParams {
+                    symbol: &symbol,
+                    trading_date: &date,
+                    minute: &minute,
+                    expiration: &expiration,
+                    pricing_mode: &pricing_mode,
+                    dealer_model: &dealer_model,
+                    max_dte,
+                })
+                .map_err(ApiError::bad_request)?;
+            let session = state
+                .replay
+                .session(&snapshot.symbol, &snapshot.date)
+                .map_err(ApiError::bad_request)?;
+            let bars = session["series"][&snapshot.symbol]["bars"].clone();
+            let label = format!(
+                "{} {} {} ET",
+                snapshot.symbol, snapshot.date, snapshot.minute
+            );
+            let symbol = snapshot.symbol.clone();
+            let snapshot_id = snapshot.snapshot_id.clone();
+            let as_of = snapshot.as_of.clone();
+            let model_version = Some(snapshot.model_version.clone());
+            let payload = serde_json::to_value(snapshot).map_err(ApiError::bad_request)?;
+            Ok(build_context(AssistantContextInput {
+                label,
+                mode: "replay".into(),
+                symbol,
+                snapshot_id,
+                as_of,
+                model_version,
+                payload,
+                market_bars: Some(bars),
+                strategy,
+            }))
+        }
+        AssistantSnapshotRef::Live { provider } => {
+            let (snapshot, closes, rv_source) = match parse_live_provider(&provider)? {
+                LiveProvider::Longbridge => (
+                    state.live.snapshot().await.map_err(ApiError::conflict)?,
+                    state
+                        .live
+                        .daily_closes(45)
+                        .await
+                        .map_err(ApiError::upstream)?,
+                    "Longbridge forward-adjusted daily closes",
+                ),
+                LiveProvider::ThetaData => (
+                    state.theta.snapshot().await.map_err(ApiError::conflict)?,
+                    state
+                        .theta
+                        .daily_closes(45)
+                        .await
+                        .map_err(ApiError::upstream)?,
+                    "ThetaData daily closes",
+                ),
+            };
+            let volatility = state
+                .replay
+                .live_volatility_context(&snapshot.chain, &closes, rv_source)
+                .map_err(ApiError::bad_request)?;
+            let label = format!("{} LIVE {}", snapshot.chain.symbol, snapshot.chain.minute);
+            let symbol = snapshot.chain.symbol.clone();
+            let snapshot_id = snapshot.chain.snapshot_id.clone();
+            let as_of = snapshot.feed.as_of.clone();
+            let model_version = Some(snapshot.chain.provenance.model.clone());
+            let bars = serde_json::to_value(&snapshot.bars).map_err(ApiError::bad_request)?;
+            let mut payload = serde_json::to_value(snapshot).map_err(ApiError::bad_request)?;
+            payload["volatility"] = volatility;
+            Ok(build_context(AssistantContextInput {
+                label,
+                mode: "live".into(),
+                symbol,
+                snapshot_id,
+                as_of,
+                model_version,
+                payload,
+                market_bars: Some(bars),
+                strategy,
+            }))
+        }
+        AssistantSnapshotRef::Audit { record_id } => {
+            let record = state
+                .audit
+                .get(&record_id)
+                .await
+                .map_err(ApiError::bad_request)?;
+            if record.kind == "assistant_analysis" {
+                return Err(ApiError::bad_request(
+                    "收藏的助手分析请使用导入会话，不可作为市场截面",
+                ));
+            }
+            let root = record.payload.get("snapshot").unwrap_or(&record.payload);
+            let chain = root.get("chain").or_else(|| record.payload.get("chain"));
+            let snapshot_id = record
+                .snapshot_id
+                .clone()
+                .or_else(|| chain.and_then(|value| value["snapshot_id"].as_str().map(String::from)))
+                .unwrap_or_else(|| format!("audit:{}", record.id));
+            let as_of = chain
+                .and_then(|value| {
+                    value["timestamp"]
+                        .as_str()
+                        .or_else(|| value["as_of"].as_str())
+                })
+                .unwrap_or(&record.created_at)
+                .to_string();
+            let model_version = chain
+                .and_then(|value| value["provenance"]["model"].as_str())
+                .map(String::from);
+            let bars = root
+                .get("bars")
+                .or_else(|| root.get("market_bars"))
+                .cloned();
+            Ok(build_context(AssistantContextInput {
+                label: format!("收藏截面 {} · {}", record.symbol, &record.id[..8]),
+                mode: record.mode,
+                symbol: record.symbol,
+                snapshot_id,
+                as_of,
+                model_version,
+                payload: record.payload,
+                market_bars: bars,
+                strategy,
+            }))
+        }
+    }
+}
+
+async fn assistant_chat(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<AssistantChatRequest>,
+) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    if request.context_refs.len() > 2 {
+        return Err(ApiError::bad_request("最多附加两个截面"));
+    }
+    let mut contexts = Vec::with_capacity(request.context_refs.len());
+    for reference in request.context_refs {
+        contexts
+            .push(resolve_assistant_context(&state, reference, request.strategy.clone()).await?);
+    }
+    let receiver = state
+        .assistant
+        .stream_chat(id, request.message, contexts)
+        .await
+        .map_err(ApiError::bad_request)?;
+    let events = stream::unfold(receiver, |mut receiver| async move {
+        receiver.recv().await.map(|event| {
+            let item = Event::default()
+                .event(event.event_name())
+                .json_data(event)
+                .unwrap_or_else(|_| Event::default().event("error").data("serialization error"));
+            (Ok(item), receiver)
+        })
+    });
+    Ok(Sse::new(events).keep_alive(KeepAlive::default()))
+}
+
+async fn favorite_assistant_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let session = state
+        .assistant
+        .get_session(&id)
+        .await
+        .map_err(ApiError::bad_request)?;
+    if session.messages.is_empty() {
+        return Err(ApiError::bad_request("空会话不能收藏"));
+    }
+    let context = session.contexts.first();
+    state
+        .audit
+        .append(AuditCaptureRequest {
+            kind: "assistant_analysis".into(),
+            mode: context
+                .map(|item| item.mode.clone())
+                .unwrap_or_else(|| "research".into()),
+            symbol: context
+                .map(|item| item.symbol.clone())
+                .unwrap_or_else(|| "ASSISTANT".into()),
+            snapshot_id: context.map(|item| item.snapshot_id.clone()),
+            payload: json!({
+                "session": session,
+                "assistant": state.assistant.status(),
+            }),
+        })
+        .await
+        .and_then(|record| serde_json::to_value(record).map_err(anyhow::Error::from))
+        .map(Json)
+        .map_err(ApiError::bad_request)
+}
+
+async fn import_assistant_session(
+    State(state): State<AppState>,
+    Json(request): Json<AssistantImportRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let record = state
+        .audit
+        .get(&request.audit_record_id)
+        .await
+        .map_err(ApiError::bad_request)?;
+    if record.kind != "assistant_analysis" {
+        return Err(ApiError::bad_request("该审计记录不是助手收藏"));
+    }
+    let session: AssistantSession =
+        serde_json::from_value(record.payload["session"].clone()).map_err(ApiError::bad_request)?;
+    let imported = state.assistant.import_session(session, record.id).await;
+    serde_json::to_value(imported)
+        .map(Json)
+        .map_err(ApiError::bad_request)
+}
+
 async fn trade_account(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     state
         .live
@@ -490,6 +871,11 @@ async fn submit_paper_orders(
     if request.strategy.mode != "live" {
         return Err(ApiError::bad_request(
             "paper orders require a live strategy",
+        ));
+    }
+    if parse_live_provider(&request.strategy.provider)? != LiveProvider::Longbridge {
+        return Err(ApiError::conflict(
+            "ThetaData is a market-data source only; paper orders require a Longbridge-priced preview",
         ));
     }
     let snapshot = state.live.snapshot().await.map_err(ApiError::conflict)?;
@@ -562,15 +948,37 @@ async fn cancel_paper_order(
 
 async fn live_stream(
     State(state): State<AppState>,
+    Query(query): Query<LiveProviderQuery>,
     websocket: WebSocketUpgrade,
-) -> impl IntoResponse {
-    websocket.on_upgrade(move |socket| stream_socket(socket, state.live))
+) -> Result<Response, ApiError> {
+    Ok(match parse_live_provider(&query.provider)? {
+        LiveProvider::Longbridge => websocket
+            .on_upgrade(move |socket| stream_socket(socket, state.live))
+            .into_response(),
+        LiveProvider::ThetaData => websocket
+            .on_upgrade(move |socket| stream_theta_socket(socket, state.theta))
+            .into_response(),
+    })
 }
 
 async fn stream_socket(socket: WebSocket, live: Arc<LiveManager>) {
+    stream_freshness_socket(socket, live.subscribe(), || live.snapshot()).await;
+}
+
+async fn stream_theta_socket(socket: WebSocket, live: Arc<ThetaLiveManager>) {
+    stream_freshness_socket(socket, live.subscribe(), || live.snapshot()).await;
+}
+
+async fn stream_freshness_socket<F, Fut>(
+    socket: WebSocket,
+    mut events: tokio::sync::broadcast::Receiver<u64>,
+    mut snapshot: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<models::LiveSnapshot>>,
+{
     let (mut sender, mut receiver) = socket.split();
-    let mut events = live.subscribe();
-    if let Ok(snapshot) = live.snapshot().await
+    if let Ok(snapshot) = snapshot().await
         && sender
             .send(Message::Text(
                 serde_json::to_string(&snapshot).unwrap().into(),
@@ -581,6 +989,11 @@ async fn stream_socket(socket: WebSocket, live: Arc<LiveManager>) {
         return;
     }
     let mut last_sent = tokio::time::Instant::now() - Duration::from_secs(1);
+    let mut freshness_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        Duration::from_secs(1),
+    );
+    freshness_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             event = events.recv() => {
@@ -588,16 +1001,10 @@ async fn stream_socket(socket: WebSocket, live: Arc<LiveManager>) {
                     Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
-                let elapsed = last_sent.elapsed();
-                if elapsed < Duration::from_millis(200) {
-                    tokio::time::sleep(Duration::from_millis(200) - elapsed).await;
-                }
-                let payload = match live.snapshot().await {
-                    Ok(snapshot) => serde_json::to_string(&snapshot).unwrap(),
-                    Err(error) => json!({"kind": "live_error", "detail": error.to_string()}).to_string(),
-                };
-                if sender.send(Message::Text(payload.into())).await.is_err() { break; }
-                last_sent = tokio::time::Instant::now();
+            }
+            _ = freshness_tick.tick() => {
+                // Reuse the cached analytics while aging freshness, even when
+                // the provider stops pushing. This does not advance sequence.
             }
             message = receiver.next() => {
                 match message {
@@ -607,8 +1014,22 @@ async fn stream_socket(socket: WebSocket, live: Arc<LiveManager>) {
                     Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
                     _ => {}
                 }
+                continue;
             }
         }
+        let elapsed = last_sent.elapsed();
+        if elapsed < Duration::from_millis(200) {
+            tokio::time::sleep(Duration::from_millis(200) - elapsed).await;
+        }
+        let payload = match snapshot().await {
+            Ok(snapshot) => serde_json::to_string(&snapshot).unwrap(),
+            Err(error) => json!({"kind": "live_error", "detail": error.to_string()}).to_string(),
+        };
+        if sender.send(Message::Text(payload.into())).await.is_err() {
+            break;
+        }
+        last_sent = tokio::time::Instant::now();
+        freshness_tick.reset();
     }
 }
 
@@ -629,6 +1050,12 @@ fn app(state: AppState, frontend_dist: PathBuf) -> Router {
                 .post(connect_longbridge)
                 .delete(disconnect_longbridge),
         )
+        .route(
+            "/api/thetadata/connection",
+            get(thetadata_connection_status)
+                .post(connect_thetadata)
+                .delete(disconnect_thetadata),
+        )
         .route("/api/oauth/status", get(oauth_status))
         .route("/api/oauth/start", post(start_oauth))
         .route("/api/live/session", post(setup_live_session))
@@ -640,6 +1067,27 @@ fn app(state: AppState, frontend_dist: PathBuf) -> Router {
             get(audit_records).post(append_audit_record),
         )
         .route("/api/audit/records/{id}", get(audit_record))
+        .route("/api/assistant/status", get(assistant_status))
+        .route(
+            "/api/assistant/sessions",
+            get(assistant_sessions).post(create_assistant_session),
+        )
+        .route(
+            "/api/assistant/sessions/import",
+            post(import_assistant_session),
+        )
+        .route(
+            "/api/assistant/sessions/{id}",
+            get(get_assistant_session).delete(delete_assistant_session),
+        )
+        .route(
+            "/api/assistant/sessions/{id}/messages",
+            post(assistant_chat),
+        )
+        .route(
+            "/api/assistant/sessions/{id}/favorite",
+            post(favorite_assistant_session),
+        )
         .route("/api/trade/account", get(trade_account))
         .route(
             "/api/trade/orders",
@@ -685,6 +1133,8 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(7311);
     let live = LiveManager::new(risk_free_rate);
     live.start_refresh_loop();
+    let theta = ThetaLiveManager::new(risk_free_rate);
+    theta.start_refresh_loop();
     let audit_path = env::var("OPTION_WORKSTATION_AUDIT_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
@@ -696,7 +1146,9 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         replay: Arc::new(ReplayStore::new(data_root, risk_free_rate)),
         live,
+        theta,
         audit: Arc::new(AuditStore::new(audit_path)),
+        assistant: Arc::new(AssistantManager::new()),
     };
     let address: SocketAddr = format!("{host}:{port}").parse()?;
     let listener = tokio::net::TcpListener::bind(address).await?;
@@ -707,4 +1159,96 @@ async fn main() -> anyhow::Result<()> {
         })
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod live_stream_tests {
+    use super::*;
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+    #[tokio::test]
+    async fn idle_longbridge_stream_heartbeats_and_exits_on_close() {
+        idle_stream_heartbeats_and_exits_on_close(false).await;
+    }
+
+    #[tokio::test]
+    async fn idle_theta_stream_heartbeats_and_exits_on_close() {
+        idle_stream_heartbeats_and_exits_on_close(true).await;
+    }
+
+    async fn idle_stream_heartbeats_and_exits_on_close(theta: bool) {
+        let live = LiveManager::new(0.043);
+        let theta_live = ThetaLiveManager::new(0.043);
+        let (completed_tx, mut completed_rx) = tokio::sync::mpsc::channel(1);
+        let router = Router::new().route(
+            "/stream",
+            get(move |websocket: WebSocketUpgrade| {
+                let live = Arc::clone(&live);
+                let theta_live = Arc::clone(&theta_live);
+                let completed_tx = completed_tx.clone();
+                async move {
+                    websocket.on_upgrade(move |socket| async move {
+                        if theta {
+                            stream_theta_socket(socket, theta_live).await;
+                        } else {
+                            stream_socket(socket, live).await;
+                        }
+                        let _ = completed_tx.send(()).await;
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+        // This local handshake uses a deterministic, public test nonce.
+        let request = format!(
+            concat!(
+                "GET /stream HTTP/1.1\r\nHost: localhost\r\n",
+                "Upgrade: websocket\r\nConnection: Upgrade\r\n",
+                "Sec-WebSocket-Key: {}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            ),
+            STANDARD.encode([0_u8; 16]),
+        );
+        socket.write_all(request.as_bytes()).await.unwrap();
+        let mut reader = BufReader::new(socket);
+        let payload = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            assert!(line.contains("101 Switching Protocols"));
+            loop {
+                line.clear();
+                reader.read_line(&mut line).await.unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            // No provider session exists and no events are sent. Only the
+            // heartbeat can deliver this frame through the normal error path.
+            assert_eq!(reader.read_u8().await.unwrap(), 0x81);
+            let length = reader.read_u8().await.unwrap();
+            assert!(length < 126);
+            let mut payload = vec![0; length as usize];
+            reader.read_exact(&mut payload).await.unwrap();
+            serde_json::from_slice::<Value>(&payload).unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(payload["kind"], "live_error");
+        // A masked empty Close frame must stop the heartbeat loop promptly.
+        reader
+            .get_mut()
+            .write_all(&[0x88, 0x80, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), completed_rx.recv())
+                .await
+                .unwrap(),
+            Some(())
+        );
+        server.abort();
+    }
 }

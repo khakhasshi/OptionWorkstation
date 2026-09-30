@@ -226,6 +226,10 @@ fn contains_secret(value: &Value) -> bool {
             ) || contains_secret(value)
         }),
         Value::Array(values) => values.iter().any(contains_secret),
+        Value::String(value) => {
+            let lower = value.to_ascii_lowercase();
+            lower.contains("hk_m_") || lower.contains("authorization: bearer")
+        }
         _ => false,
     }
 }
@@ -305,5 +309,13 @@ mod tests {
             payload: serde_json::json!({"access_token": "secret"}),
         };
         assert!(validate_request(&request).is_err());
+        let raw_token = AuditCaptureRequest {
+            kind: "assistant_analysis".into(),
+            mode: "replay".into(),
+            symbol: "SPY".into(),
+            snapshot_id: None,
+            payload: serde_json::json!({"message": "hk_m_example-token"}),
+        };
+        assert!(validate_request(&raw_token).is_err());
     }
 }

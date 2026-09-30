@@ -2,6 +2,11 @@
 
 This roadmap describes direction, not a delivery promise.
 
+The next-stage trading workflow and factor visualization plan is documented in
+[交易工作流与期权因子可视化开发路线图](docs/TRADING_WORKFLOW_ROADMAP.zh-CN.md).
+It defines P0/P1 scope, dependencies, data contracts, and acceptance criteria;
+its planned features are not claims of current capability.
+
 ## 0.1 Public Preview
 
 - reproducible source and container builds;

@@ -48,6 +48,7 @@ const OPTION_REQUEST_COOLDOWN: Duration = Duration::from_secs(65);
 const OPTION_RETRY_MARKER: &str = "option_retry_after_ms=";
 const OAUTH_CALLBACK_PORT: u16 = 60355;
 const OAUTH_URL_TIMEOUT: Duration = Duration::from_secs(10);
+const QUOTE_STALE_AFTER_MS: i64 = 5_000;
 
 #[derive(Clone, Default)]
 struct MemoryTokenStorage {
@@ -155,6 +156,66 @@ struct OAuthFlowState {
     task: Option<JoinHandle<()>>,
 }
 
+struct CachedLiveSnapshot {
+    snapshot: LiveSnapshot,
+    observed_at: DateTime<Utc>,
+    observed_instant: Instant,
+    underlying_at: DateTime<Utc>,
+    option_timestamps: Vec<Option<DateTime<Utc>>>,
+    selected_option_timestamps: Vec<Option<DateTime<Utc>>>,
+}
+
+impl CachedLiveSnapshot {
+    fn effective_now(&self, now: DateTime<Utc>, instant: Instant) -> DateTime<Utc> {
+        let elapsed_ms = instant
+            .saturating_duration_since(self.observed_instant)
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+        self.observed_at
+            .checked_add_signed(chrono::Duration::milliseconds(elapsed_ms))
+            .unwrap_or(DateTime::<Utc>::MAX_UTC)
+            .max(now)
+    }
+
+    fn at(&mut self, now: DateTime<Utc>, instant: Instant) -> LiveSnapshot {
+        // Keep an effective UTC clock that advances with monotonic time even
+        // through wall-clock rollback or a cache rebuild without new quotes.
+        let now = self.effective_now(now, instant);
+        self.observed_at = now;
+        self.observed_instant = instant;
+        let age_ms = |timestamp: DateTime<Utc>| (now - timestamp).num_milliseconds().max(0);
+        let coverage = |timestamps: &[Option<DateTime<Utc>>]| {
+            let fresh = timestamps
+                .iter()
+                .filter(|timestamp| {
+                    timestamp.is_some_and(|timestamp| age_ms(timestamp) <= QUOTE_STALE_AFTER_MS)
+                })
+                .count();
+            (fresh as f64 / timestamps.len().max(1) as f64 * 10_000.0).round() / 100.0
+        };
+        let mut snapshot = self.snapshot.clone();
+        let spot_age_ms = age_ms(self.underlying_at);
+        snapshot.chain.quality.spot_age_ms = Some(spot_age_ms);
+        snapshot.chain.quality.fresh_quote_coverage_pct =
+            coverage(&self.selected_option_timestamps);
+        snapshot.feed.latency_ms = spot_age_ms;
+        snapshot.feed.fresh_quote_coverage_pct = coverage(&self.option_timestamps);
+        snapshot.feed.quality_state = if snapshot.feed.quote_coverage_pct < 80.0 {
+            "degraded_quotes"
+        } else if spot_age_ms > QUOTE_STALE_AFTER_MS {
+            "stale_underlying"
+        } else if snapshot.feed.fresh_quote_coverage_pct < 80.0 {
+            "stale_options"
+        } else if snapshot.feed.metadata_coverage_pct < 90.0 {
+            "waiting_metadata"
+        } else {
+            "ready"
+        }
+        .into();
+        snapshot
+    }
+}
+
 pub struct LiveManager {
     state: RwLock<ManagerState>,
     session_setup: Mutex<()>,
@@ -165,7 +226,7 @@ pub struct LiveManager {
     refresh_started: AtomicBool,
     oauth_sequence: AtomicU64,
     oauth_flow: Mutex<OAuthFlowState>,
-    snapshot_cache: Mutex<Option<(u64, LiveSnapshot)>>,
+    snapshot_cache: Mutex<Option<CachedLiveSnapshot>>,
     risk_free_rate: f64,
     paper_execution_requested: bool,
 }
@@ -720,6 +781,7 @@ impl LiveManager {
                 .collect::<String>()
         );
         let status = ConnectionStatus {
+            provider: "longbridge".into(),
             connected: true,
             state: "connected".into(),
             auth_method: auth_method.into(),
@@ -1112,14 +1174,28 @@ impl LiveManager {
     }
 
     pub async fn snapshot(&self) -> anyhow::Result<LiveSnapshot> {
-        let sequence = self.sequence.load(Ordering::Relaxed);
+        self.snapshot_with_clock(|| (Utc::now(), Instant::now()))
+            .await
+    }
+
+    async fn snapshot_with_clock(
+        &self,
+        clock: impl Fn() -> (DateTime<Utc>, Instant),
+    ) -> anyhow::Result<LiveSnapshot> {
         let mut cache = self.snapshot_cache.lock().await;
-        if let Some((cached_sequence, snapshot)) = cache.as_ref()
-            && *cached_sequence == sequence
+        let sequence = self.sequence.load(Ordering::Relaxed);
+        if cache
+            .as_ref()
+            .is_none_or(|cached| cached.snapshot.sequence != sequence)
         {
-            return Ok(snapshot.clone());
+            let (now, instant) = clock();
+            let now = cache
+                .as_ref()
+                .map_or(now, |cached| cached.effective_now(now, instant));
+            *cache = Some(self.build_snapshot(sequence, now, instant).await?);
         }
-        let snapshot = self.build_snapshot(sequence).await?;
+        let (now, instant) = clock();
+        let snapshot = cache.as_mut().unwrap().at(now, instant);
         {
             let mut state = self.state.write().await;
             state.status.last_snapshot_at = Some(snapshot.chain.timestamp.clone());
@@ -1129,11 +1205,15 @@ impl LiveManager {
             state.status.active_symbol = Some(snapshot.feed.symbol.clone());
             state.status.switch_state = "ready".into();
         }
-        *cache = Some((sequence, snapshot.clone()));
         Ok(snapshot)
     }
 
-    async fn build_snapshot(&self, sequence: u64) -> anyhow::Result<LiveSnapshot> {
+    async fn build_snapshot(
+        &self,
+        sequence: u64,
+        now: DateTime<Utc>,
+        instant: Instant,
+    ) -> anyhow::Result<CachedLiveSnapshot> {
         let active = self
             .state
             .read()
@@ -1147,55 +1227,55 @@ impl LiveManager {
             .get(&active.underlying)
             .map(|value| value.clone())
             .ok_or_else(|| anyhow!("waiting for underlying quote"))?;
-        let now = Utc::now();
-        let as_of = active
+        // Capture each book once so cached timestamps describe the same prices
+        // as the analytics, even if a provider push arrives during calculation.
+        let books: Vec<_> = active
             .contracts
             .iter()
-            .filter_map(|contract| {
-                self.cache
-                    .depth
-                    .get(&contract.symbol)
-                    .and_then(|book| book.timestamp)
+            .map(|contract| {
+                (
+                    contract,
+                    self.cache
+                        .depth
+                        .get(&contract.symbol)
+                        .map(|book| book.clone()),
+                )
             })
+            .collect();
+        let as_of = books
+            .iter()
+            .filter_map(|(_, book)| book.as_ref().and_then(|book| book.timestamp))
             .fold(underlying.timestamp, std::cmp::max);
         let spot_age_ms = (now - underlying.timestamp).num_milliseconds().max(0);
         let mut chains = Vec::new();
         for expiration in &active.expirations {
-            let expiration_contracts: Vec<_> = active
-                .contracts
+            let expiration_contracts: Vec<_> = books
                 .iter()
-                .filter(|contract| &contract.expiration == expiration)
+                .filter(|(contract, _)| &contract.expiration == expiration)
                 .collect();
             let quote_contracts = expiration_contracts
                 .iter()
-                .filter(|contract| self.cache.depth.contains_key(&contract.symbol))
+                .filter(|(_, book)| book.is_some())
                 .count();
             let metadata_contracts = expiration_contracts
                 .iter()
-                .filter(|contract| self.cache.metrics.contains_key(&contract.symbol))
+                .filter(|(contract, _)| self.cache.metrics.contains_key(&contract.symbol))
                 .count();
             let fresh_contracts = expiration_contracts
                 .iter()
-                .filter(|contract| {
-                    self.cache
-                        .depth
-                        .get(&contract.symbol)
+                .filter(|(_, book)| {
+                    book.as_ref()
                         .and_then(|book| book.timestamp)
-                        .is_some_and(|timestamp| (now - timestamp).num_milliseconds() <= 5_000)
+                        .is_some_and(|timestamp| {
+                            (now - timestamp).num_milliseconds() <= QUOTE_STALE_AFTER_MS
+                        })
                 })
                 .count();
             let contract_count = expiration_contracts.len().max(1) as f64;
-            let raw: Vec<RawOptionQuote> = active
-                .contracts
+            let raw: Vec<RawOptionQuote> = expiration_contracts
                 .iter()
-                .filter(|contract| &contract.expiration == expiration)
-                .map(|contract| {
-                    let book = self
-                        .cache
-                        .depth
-                        .get(&contract.symbol)
-                        .map(|value| value.clone())
-                        .unwrap_or_default();
+                .map(|(contract, book)| {
+                    let book = book.clone().unwrap_or_default();
                     let metrics = self
                         .cache
                         .metrics
@@ -1254,20 +1334,15 @@ impl LiveManager {
             .get(&active.underlying)
             .map(|value| value.clone())
             .unwrap_or_default();
-        let quote_contracts = active
-            .contracts
+        let quote_contracts = books.iter().filter(|(_, book)| book.is_some()).count();
+        let fresh_contracts = books
             .iter()
-            .filter(|contract| self.cache.depth.contains_key(&contract.symbol))
-            .count();
-        let fresh_contracts = active
-            .contracts
-            .iter()
-            .filter(|contract| {
-                self.cache
-                    .depth
-                    .get(&contract.symbol)
+            .filter(|(_, book)| {
+                book.as_ref()
                     .and_then(|book| book.timestamp)
-                    .is_some_and(|timestamp| (now - timestamp).num_milliseconds() <= 5_000)
+                    .is_some_and(|timestamp| {
+                        (now - timestamp).num_milliseconds() <= QUOTE_STALE_AFTER_MS
+                    })
             })
             .count();
         let metadata_contracts = active
@@ -1281,7 +1356,7 @@ impl LiveManager {
         let metadata_coverage_pct = metadata_contracts as f64 / total * 100.0;
         let quality_state = if quote_coverage_pct < 80.0 {
             "degraded_quotes"
-        } else if spot_age_ms > 5_000 {
+        } else if spot_age_ms > QUOTE_STALE_AFTER_MS {
             "stale_underlying"
         } else if fresh_quote_coverage_pct < 80.0 {
             "stale_options"
@@ -1290,13 +1365,22 @@ impl LiveManager {
         } else {
             "ready"
         };
-        Ok(LiveSnapshot {
+        let option_timestamps = books
+            .iter()
+            .map(|(_, book)| book.as_ref().and_then(|book| book.timestamp))
+            .collect();
+        let selected_option_timestamps = books
+            .iter()
+            .filter(|(contract, _)| contract.expiration == active.selected_expiration)
+            .map(|(_, book)| book.as_ref().and_then(|book| book.timestamp))
+            .collect();
+        let snapshot = LiveSnapshot {
             kind: "live_snapshot",
             sequence,
             feed: LiveFeedInfo {
-                source: "Longbridge",
-                transport: "Longbridge Rust SDK WebSocket -> local WebSocket",
-                sdk_version: SDK_VERSION,
+                source: "Longbridge".into(),
+                transport: "Longbridge Rust SDK WebSocket -> local WebSocket".into(),
+                sdk_version: SDK_VERSION.into(),
                 symbol: active.display_symbol,
                 expiration: active.selected_expiration.to_string(),
                 expirations: active.expirations.iter().map(ToString::to_string).collect(),
@@ -1308,13 +1392,21 @@ impl LiveManager {
                 metadata_coverage_pct: (metadata_coverage_pct * 100.0).round() / 100.0,
                 subscription_limit: OPENAPI_SUBSCRIPTION_LIMIT,
                 as_of: as_of.to_rfc3339(),
-                stale_after_ms: 5_000,
+                stale_after_ms: QUOTE_STALE_AFTER_MS as u64,
                 latency_ms: spot_age_ms,
                 quality_state: quality_state.into(),
             },
             bars,
             chain,
             surface,
+        };
+        Ok(CachedLiveSnapshot {
+            snapshot,
+            observed_at: now,
+            observed_instant: instant,
+            underlying_at: underlying.timestamp,
+            option_timestamps,
+            selected_option_timestamps,
         })
     }
 }
@@ -1513,6 +1605,242 @@ fn apply_push(cache: &LiveCache, event: PushEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::strategy::{StrategyLegInput, analyze_strategy};
+
+    async fn seeded_live_manager(timestamp: DateTime<Utc>) -> Arc<LiveManager> {
+        let manager = LiveManager::new(0.043);
+        let expirations = vec![
+            NaiveDate::from_ymd_opt(2026, 10, 2).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 10, 9).unwrap(),
+        ];
+        let contracts: Vec<_> = expirations
+            .iter()
+            .flat_map(|expiration| {
+                ["CALL", "PUT"].map(|right| ContractDef {
+                    symbol: format!("TEST-{expiration}-{right}"),
+                    expiration: *expiration,
+                    strike: 100.0,
+                    right: right.into(),
+                })
+            })
+            .collect();
+        manager.cache.quotes.insert(
+            "TEST.US".into(),
+            LiveQuote {
+                last: 100.0,
+                timestamp,
+            },
+        );
+        for contract in &contracts {
+            manager.cache.depth.insert(
+                contract.symbol.clone(),
+                TopOfBook {
+                    bid: 2.0,
+                    ask: 2.1,
+                    bid_size: 20,
+                    ask_size: 20,
+                    timestamp: Some(timestamp),
+                },
+            );
+            manager.cache.metrics.insert(
+                contract.symbol.clone(),
+                OptionMetrics {
+                    open_interest: 100,
+                    ..Default::default()
+                },
+            );
+        }
+        manager.state.write().await.active = Some(ActiveUniverse {
+            underlying: "TEST.US".into(),
+            display_symbol: "TEST".into(),
+            selected_expiration: expirations[0],
+            expirations,
+            contracts,
+            pricing_mode: "micro".into(),
+            dealer_model: "classic".into(),
+        });
+        manager
+    }
+
+    fn test_strategy(snapshot: &LiveSnapshot) -> crate::strategy::StrategyAnalysis {
+        analyze_strategy(
+            &snapshot.chain,
+            &[StrategyLegInput {
+                symbol: None,
+                strike: 100.0,
+                right: "CALL".into(),
+                side: "BUY".into(),
+                ratio: 1,
+            }],
+            1,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cached_snapshot_expires_without_push_and_recovers_after_new_quotes() {
+        let now = DateTime::parse_from_rfc3339("2026-09-30T14:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let instant = Instant::now();
+        let manager = seeded_live_manager(now).await;
+        let fresh = manager
+            .snapshot_with_clock(|| (now, instant))
+            .await
+            .unwrap();
+        let fresh_analysis = test_strategy(&fresh);
+        assert!(fresh_analysis.executable);
+        assert_eq!(fresh.feed.quality_state, "ready");
+
+        let boundary = manager
+            .snapshot_with_clock(|| {
+                (
+                    now + chrono::Duration::milliseconds(5_000),
+                    instant + Duration::from_millis(5_000),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(boundary.chain.quality.spot_age_ms, Some(5_000));
+        assert_eq!(boundary.chain.quality.fresh_quote_coverage_pct, 100.0);
+        assert!(test_strategy(&boundary).executable);
+        assert_eq!(boundary.chain.snapshot_id, fresh.chain.snapshot_id);
+        assert_eq!(
+            serde_json::to_value(&boundary.surface).unwrap(),
+            serde_json::to_value(&fresh.surface).unwrap()
+        );
+
+        let stale = manager
+            .snapshot_with_clock(|| {
+                (
+                    now + chrono::Duration::milliseconds(5_001),
+                    instant + Duration::from_millis(5_001),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(stale.sequence, fresh.sequence);
+        assert_eq!(stale.chain.timestamp, fresh.chain.timestamp);
+        assert_eq!(stale.feed.as_of, fresh.feed.as_of);
+        assert_eq!(stale.chain.quality.spot_age_ms, Some(5_001));
+        assert_eq!(stale.chain.quality.fresh_quote_coverage_pct, 0.0);
+        assert_eq!(stale.feed.fresh_quote_coverage_pct, 0.0);
+        assert_eq!(stale.feed.quality_state, "stale_underlying");
+        assert_eq!(manager.state.read().await.status.latency_ms, Some(5_001));
+        let stale_analysis = test_strategy(&stale);
+        assert_eq!(stale_analysis.preview_id, fresh_analysis.preview_id);
+        assert!(!stale_analysis.executable);
+        assert!(
+            stale_analysis
+                .blockers
+                .iter()
+                .any(|message| message.contains("fresh quote coverage"))
+        );
+        assert!(
+            stale_analysis
+                .blockers
+                .iter()
+                .any(|message| message.contains("underlying quote age"))
+        );
+
+        // A new sequence, unlike the wall clock alone, rebuilds price analytics.
+        let updated_at = now + chrono::Duration::seconds(6);
+        manager.cache.quotes.get_mut("TEST.US").unwrap().timestamp = updated_at;
+        for mut book in manager.cache.depth.iter_mut() {
+            book.timestamp = Some(updated_at);
+            book.bid = 2.1;
+            book.ask = 2.2;
+        }
+        manager.notify();
+        let updated = manager
+            .snapshot_with_clock(|| (updated_at, instant + Duration::from_secs(6)))
+            .await
+            .unwrap();
+        assert!(updated.sequence > fresh.sequence);
+        assert_ne!(updated.chain.snapshot_id, fresh.chain.snapshot_id);
+        assert_eq!(updated.chain.rows[0].bid, 2.1);
+        assert_eq!(updated.chain.quality.spot_age_ms, Some(0));
+        assert_eq!(updated.chain.quality.fresh_quote_coverage_pct, 100.0);
+        assert!(test_strategy(&updated).executable);
+    }
+
+    #[tokio::test]
+    async fn cached_snapshot_ages_selected_expiration_and_universe_separately() {
+        let quote_at = DateTime::parse_from_rfc3339("2026-09-30T14:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let now = quote_at + chrono::Duration::seconds(4);
+        let instant = Instant::now();
+        let manager = seeded_live_manager(quote_at).await;
+        manager.cache.quotes.get_mut("TEST.US").unwrap().timestamp = now;
+        for mut book in manager.cache.depth.iter_mut() {
+            if book.key().contains("2026-10-09") {
+                book.timestamp = Some(now);
+            }
+        }
+        let fresh = manager
+            .snapshot_with_clock(|| (now, instant))
+            .await
+            .unwrap();
+        assert_eq!(fresh.chain.quality.fresh_quote_coverage_pct, 100.0);
+        let stale = manager
+            .snapshot_with_clock(|| {
+                (
+                    now + chrono::Duration::milliseconds(1_001),
+                    instant + Duration::from_millis(1_001),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(stale.chain.quality.spot_age_ms, Some(1_001));
+        assert_eq!(stale.chain.quality.fresh_quote_coverage_pct, 0.0);
+        assert_eq!(stale.feed.fresh_quote_coverage_pct, 50.0);
+        assert_eq!(stale.feed.quality_state, "stale_options");
+        assert!(!test_strategy(&stale).executable);
+    }
+
+    #[tokio::test]
+    async fn cached_snapshot_does_not_become_fresh_after_wall_clock_rollback() {
+        let now = DateTime::parse_from_rfc3339("2026-09-30T14:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let instant = Instant::now();
+        let manager = seeded_live_manager(now).await;
+        manager
+            .snapshot_with_clock(|| (now, instant))
+            .await
+            .unwrap();
+        let stale = manager
+            .snapshot_with_clock(|| {
+                (
+                    now - chrono::Duration::seconds(30),
+                    instant + Duration::from_secs(6),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(stale.chain.quality.spot_age_ms, Some(6_000));
+        assert_eq!(stale.chain.quality.fresh_quote_coverage_pct, 0.0);
+        assert_eq!(stale.feed.quality_state, "stale_underlying");
+        assert!(!test_strategy(&stale).executable);
+
+        // Metadata or an unrelated push can advance sequence without refreshing
+        // these quotes. Rebuilding analytics must retain the effective clock.
+        manager.notify();
+        let rebuilt = manager
+            .snapshot_with_clock(|| {
+                (
+                    now - chrono::Duration::seconds(29),
+                    instant + Duration::from_secs(7),
+                )
+            })
+            .await
+            .unwrap();
+        assert!(rebuilt.sequence > stale.sequence);
+        assert_eq!(rebuilt.chain.quality.spot_age_ms, Some(7_000));
+        assert_eq!(rebuilt.chain.quality.fresh_quote_coverage_pct, 0.0);
+        assert!(!test_strategy(&rebuilt).executable);
+    }
 
     #[test]
     fn symbol_normalization_is_strict() {

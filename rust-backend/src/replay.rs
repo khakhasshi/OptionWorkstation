@@ -7,17 +7,20 @@ use std::{
 
 use anyhow::{Context, anyhow};
 use arrow_array::{
-    Array, Float64Array, Int64Array, LargeStringArray, RecordBatch, StringArray, StringViewArray,
-    TimestampMicrosecondArray,
+    Array, BooleanArray, Float64Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
+    StringViewArray, TimestampMicrosecondArray,
 };
 use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc};
 use chrono_tz::America::New_York;
 use moka::sync::Cache;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::{
+    ProjectionMask,
+    arrow_reader::{ArrowPredicateFn, ParquetRecordBatchReaderBuilder, RowFilter},
+};
 use serde_json::{Value, json};
 
 use crate::{
-    analytics::{ChainBuild, build_chain, build_surface},
+    analytics::{ChainBuild, atm_implied_volatility, build_chain, build_surface},
     models::{Bar, ChainSnapshot, RawOptionQuote, ReplaySnapshot, SurfaceSnapshot},
     volatility::{IvHistoryPoint, VolatilityInput, build_context},
 };
@@ -186,8 +189,8 @@ impl ReplayStore {
                 let oi = self
                     .open_interest(symbol, trading_date, expiration)
                     .map_err(Arc::new)?;
-                let rows =
-                    read_option_quotes(&path, symbol, expiry, minute, &oi).map_err(Arc::new)?;
+                let rows = read_option_quotes(&path, symbol, trading_date, expiry, minute, &oi)
+                    .map_err(Arc::new)?;
                 Ok::<_, Arc<anyhow::Error>>(Arc::new(rows))
             })
             .map_err(|error| anyhow!(error.to_string()))
@@ -264,6 +267,7 @@ impl ReplayStore {
         let expiry = NaiveDate::parse_from_str(expiration, "%Y-%m-%d")?;
         let quotes = self.option_quotes(&clean, trading_date, expiration, minute)?;
         anyhow::ensure!(!quotes.is_empty(), "No option quotes at {minute}");
+        let oi = self.open_interest(&clean, trading_date, expiration)?;
         build_chain(ChainBuild {
             symbol: &clean,
             spot: self.spot_at(&clean, trading_date, minute)?,
@@ -279,15 +283,7 @@ impl ReplayStore {
             prefer_sdk_greeks: false,
             quote_coverage: 100.0,
             fresh_quote_coverage: 100.0,
-            metadata_coverage: if self
-                .option_day_dir(&clean, trading_date)
-                .join(format!("expiration={expiration}/open_interest.parquet"))
-                .is_file()
-            {
-                100.0
-            } else {
-                0.0
-            },
+            metadata_coverage: open_interest_coverage(&quotes, &oi),
             spot_age_ms: Some(0),
         })
     }
@@ -421,6 +417,7 @@ impl ReplayStore {
         &self,
         snapshot: &ChainSnapshot,
         daily_closes: &[(String, f64)],
+        rv_source: &str,
     ) -> anyhow::Result<Value> {
         let history = if self.symbol_dir(&snapshot.symbol).is_dir() {
             self.matched_iv_history(
@@ -445,7 +442,7 @@ impl ReplayStore {
             closes: daily_closes.iter().map(|(_, close)| *close).collect(),
             rv_through: daily_closes.last().map(|(date, _)| date.clone()),
             iv_source: "ThetaData 50-session matched-DTE ATM IV".into(),
-            rv_source: "Longbridge forward-adjusted daily closes".into(),
+            rv_source: rv_source.into(),
         }))
         .map_err(anyhow::Error::from)
     }
@@ -501,16 +498,23 @@ impl ReplayStore {
         if (matched_dte - target_dte).abs() > tolerance {
             return None;
         }
-        let chain = self
-            .chain(symbol, trading_date, minute, &expiry, "mid", "classic")
-            .ok()
-            .or_else(|| {
-                self.chain(symbol, trading_date, "15:30", &expiry, "mid", "classic")
-                    .ok()
-            })?;
+        let clean = self.validate_symbol(symbol).ok()?;
+        self.validate_date(&clean, trading_date).ok()?;
+        let iv_at = |minute: &str| -> anyhow::Result<f64> {
+            let quotes = self.option_quotes(&clean, trading_date, &expiry, minute)?;
+            atm_implied_volatility(
+                self.spot_at(&clean, trading_date, minute)?,
+                replay_as_of(trading_date, minute)?,
+                expiry_date,
+                &quotes,
+                "mid",
+                self.risk_free_rate,
+            )
+        };
+        let iv = iv_at(minute).ok().or_else(|| iv_at("15:30").ok())?;
         Some(IvHistoryPoint {
             date: trading_date.into(),
-            iv: chain.metrics.atm_iv?,
+            iv,
             dte: matched_dte,
         })
     }
@@ -661,7 +665,13 @@ fn read_open_interest(path: &Path) -> anyhow::Result<OiMap> {
         let right = TextColumn::from_batch(&batch, "right")?;
         let oi = typed::<Int64Array>(&batch, "open_interest")?;
         for row in 0..batch.num_rows() {
-            if strike.is_null(row) || right.is_null(row) || oi.is_null(row) {
+            if strike.is_null(row)
+                || right.is_null(row)
+                || oi.is_null(row)
+                || !strike.value(row).is_finite()
+                || strike.value(row) <= 0.0
+                || oi.value(row) < 0
+            {
                 continue;
             }
             values.insert(
@@ -676,17 +686,69 @@ fn read_open_interest(path: &Path) -> anyhow::Result<OiMap> {
     Ok(values)
 }
 
+fn open_interest_coverage(quotes: &[RawOptionQuote], oi: &OiMap) -> f64 {
+    let contracts: HashSet<_> = quotes
+        .iter()
+        .map(|quote| ((quote.strike * 1000.0).round() as i64, quote.right.clone()))
+        .collect();
+    if contracts.is_empty() {
+        return 0.0;
+    }
+    // A reported zero is known metadata; a missing/null observation is not.
+    // Match only contracts quoted at this replay minute, never a file's row count.
+    let available = contracts.iter().filter(|key| oi.contains_key(*key)).count();
+    available as f64 / contracts.len() as f64 * 100.0
+}
+
 fn read_option_quotes(
     path: &Path,
     underlying: &str,
+    trading_date: &str,
     expiration: NaiveDate,
     minute: &str,
     oi: &OiMap,
 ) -> anyhow::Result<Vec<RawOptionQuote>> {
+    let minute_start = replay_as_of(trading_date, minute)?.timestamp_micros();
+    let minute_end = minute_start + 60_000_000;
+    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    // Validate before filtering: an empty minute must not conceal malformed schemas.
+    let schema_batch = RecordBatch::new_empty(builder.schema().clone());
+    typed::<TimestampMicrosecondArray>(&schema_batch, "timestamp")?;
+    for column in ["strike", "bid", "ask"] {
+        typed::<Float64Array>(&schema_batch, column)?;
+    }
+    for column in ["bid_size", "ask_size"] {
+        typed::<Int64Array>(&schema_batch, column)?;
+    }
+    TextColumn::from_batch(&schema_batch, "right")?;
+    let timestamp_index = builder.schema().index_of("timestamp")?;
+    let quote_indexes = ["strike", "right", "bid_size", "ask_size", "bid", "ask"]
+        .into_iter()
+        .map(|name| builder.schema().index_of(name))
+        .collect::<Result<Vec<_>, _>>()?;
+    let timestamp_projection = ProjectionMask::roots(builder.parquet_schema(), [timestamp_index]);
+    let quote_projection = ProjectionMask::roots(builder.parquet_schema(), quote_indexes);
+    let predicate = ArrowPredicateFn::new(timestamp_projection, move |batch| {
+        let timestamps = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("timestamp schema validated before filtering");
+        Ok(BooleanArray::from_iter(timestamps.iter().map(
+            |timestamp| {
+                Some(timestamp.is_some_and(|value| value >= minute_start && value < minute_end))
+            },
+        )))
+    });
+    let reader = builder
+        .with_batch_size(16_384)
+        .with_projection(quote_projection)
+        .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+        .build()?;
     let mut quotes = Vec::new();
-    for batch in record_batches(path)? {
+    for batch in reader {
         let batch = batch?;
-        let timestamp = typed::<TimestampMicrosecondArray>(&batch, "timestamp")?;
         let strike = typed::<Float64Array>(&batch, "strike")?;
         let right = TextColumn::from_batch(&batch, "right")?;
         let bid_size = typed::<Int64Array>(&batch, "bid_size")?;
@@ -694,12 +756,7 @@ fn read_option_quotes(
         let bid = typed::<Float64Array>(&batch, "bid")?;
         let ask = typed::<Float64Array>(&batch, "ask")?;
         for row in 0..batch.num_rows() {
-            if timestamp.is_null(row) || strike.is_null(row) || right.is_null(row) {
-                continue;
-            }
-            let utc = DateTime::<Utc>::from_timestamp_micros(timestamp.value(row))
-                .ok_or_else(|| anyhow!("invalid timestamp"))?;
-            if utc.with_timezone(&New_York).format("%H:%M").to_string() != minute {
+            if strike.is_null(row) || right.is_null(row) {
                 continue;
             }
             let strike_value = strike.value(row);
@@ -754,7 +811,481 @@ fn read_option_quotes(
 
 #[cfg(test)]
 mod tests {
-    use super::point_in_time_history_minute;
+    use super::*;
+    use arrow_array::ArrayRef;
+    use parquet::arrow::ArrowWriter;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const DATE: &str = "2026-06-01";
+    const EXPIRATION: &str = "2026-06-12";
+    const MINUTE: &str = "09:31";
+    static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+    struct ReplayFixture {
+        store: ReplayStore,
+    }
+
+    impl ReplayFixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "option-workstation-replay-{}-{}-{}",
+                std::process::id(),
+                Utc::now().timestamp_nanos_opt().unwrap(),
+                NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed),
+            ));
+            let store = ReplayStore::new(root, 0.04);
+            let timestamp = replay_as_of(DATE, MINUTE).unwrap().timestamp_micros();
+            write_parquet(
+                &store
+                    .symbol_dir("TEST")
+                    .join(format!("date={DATE}/ohlc.parquet")),
+                vec![
+                    (
+                        "timestamp",
+                        Arc::new(TimestampMicrosecondArray::from(vec![timestamp])),
+                    ),
+                    ("open", Arc::new(Float64Array::from(vec![100.0]))),
+                    ("high", Arc::new(Float64Array::from(vec![100.0]))),
+                    ("low", Arc::new(Float64Array::from(vec![100.0]))),
+                    ("close", Arc::new(Float64Array::from(vec![100.0]))),
+                    ("volume", Arc::new(Int64Array::from(vec![1_000]))),
+                    ("vwap", Arc::new(Float64Array::from(vec![100.0]))),
+                ],
+            );
+            write_parquet(
+                &store
+                    .option_day_dir("TEST", DATE)
+                    .join(format!("expiration={EXPIRATION}/quote_1m.parquet")),
+                vec![
+                    (
+                        "timestamp",
+                        Arc::new(TimestampMicrosecondArray::from(vec![timestamp; 2])),
+                    ),
+                    ("strike", Arc::new(Float64Array::from(vec![100.0; 2]))),
+                    ("right", Arc::new(StringArray::from(vec!["CALL", "PUT"]))),
+                    ("bid_size", Arc::new(Int64Array::from(vec![10; 2]))),
+                    ("ask_size", Arc::new(Int64Array::from(vec![10; 2]))),
+                    ("bid", Arc::new(Float64Array::from(vec![2.0; 2]))),
+                    ("ask", Arc::new(Float64Array::from(vec![2.2; 2]))),
+                ],
+            );
+            Self { store }
+        }
+
+        fn oi(&self, date: &str, rows: &[(f64, &str, Option<i64>)]) {
+            write_parquet(
+                &self
+                    .store
+                    .option_day_dir("TEST", date)
+                    .join(format!("expiration={EXPIRATION}/open_interest.parquet")),
+                vec![
+                    (
+                        "strike",
+                        Arc::new(Float64Array::from(
+                            rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+                        )),
+                    ),
+                    (
+                        "right",
+                        Arc::new(StringArray::from(
+                            rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+                        )),
+                    ),
+                    (
+                        "open_interest",
+                        Arc::new(Int64Array::from(
+                            rows.iter().map(|row| row.2).collect::<Vec<_>>(),
+                        )),
+                    ),
+                ],
+            );
+        }
+
+        fn chain(&self) -> ChainSnapshot {
+            self.store
+                .chain("TEST", DATE, MINUTE, EXPIRATION, "mid", "classic")
+                .unwrap()
+        }
+    }
+
+    impl Drop for ReplayFixture {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(self.store.root()).unwrap();
+        }
+    }
+
+    fn write_parquet(path: &Path, columns: Vec<(&str, ArrayRef)>) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let batch = RecordBatch::try_from_iter(columns).unwrap();
+        let properties = parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_row_count(Some(3))
+            .build();
+        let mut writer = ArrowWriter::try_new(
+            File::create(path).unwrap(),
+            batch.schema(),
+            Some(properties),
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    fn quote_columns(
+        timestamps: Vec<Option<i64>>,
+        strikes: Vec<f64>,
+    ) -> Vec<(&'static str, ArrayRef)> {
+        let count = timestamps.len();
+        vec![
+            (
+                "timestamp",
+                Arc::new(TimestampMicrosecondArray::from(timestamps)),
+            ),
+            ("strike", Arc::new(Float64Array::from(strikes))),
+            ("right", Arc::new(StringArray::from(vec!["CALL"; count]))),
+            ("bid_size", Arc::new(Int64Array::from(vec![10; count]))),
+            ("ask_size", Arc::new(Int64Array::from(vec![20; count]))),
+            ("bid", Arc::new(Float64Array::from(vec![2.0; count]))),
+            ("ask", Arc::new(Float64Array::from(vec![2.2; count]))),
+        ]
+    }
+
+    #[test]
+    fn parquet_minute_filter_preserves_order_and_null_semantics_across_row_groups() {
+        let fixture = ReplayFixture::new();
+        let path = fixture.store.root().join("minute-filter.parquet");
+        let start = replay_as_of(DATE, MINUTE).unwrap().timestamp_micros();
+        let day = 86_400_000_000;
+        let mut columns = quote_columns(
+            vec![
+                Some(start - 1),
+                Some(start),
+                Some(start + day),
+                Some(start + 59_999_999),
+                Some(start - day),
+                None,
+                Some(start + 60_000_000),
+                Some(start + 2),
+                Some(start + 3),
+                Some(start + 1),
+            ],
+            vec![
+                99.0, 100.0, 101.0, 100.0, 103.0, 104.0, 105.0, 106.0, 107.0, 102.0,
+            ],
+        );
+        columns[1].1 = Arc::new(Float64Array::from(vec![
+            Some(99.0),
+            Some(100.0),
+            Some(101.0),
+            Some(100.0),
+            Some(103.0),
+            Some(104.0),
+            Some(105.0),
+            None,
+            Some(107.0),
+            Some(102.0),
+        ]));
+        columns[2].1 = Arc::new(StringArray::from(vec![
+            Some("CALL"),
+            Some("call"),
+            Some("CALL"),
+            Some("PUT"),
+            Some("CALL"),
+            Some("CALL"),
+            Some("CALL"),
+            Some("CALL"),
+            None,
+            Some("CALL"),
+        ]));
+        let mut bid_sizes = vec![Some(10); 10];
+        bid_sizes[1] = None;
+        columns[3].1 = Arc::new(Int64Array::from(bid_sizes));
+        let mut ask_sizes = vec![Some(20); 10];
+        ask_sizes[3] = None;
+        columns[4].1 = Arc::new(Int64Array::from(ask_sizes));
+        let mut bids = vec![Some(2.0); 10];
+        bids[1] = None;
+        columns[5].1 = Arc::new(Float64Array::from(bids));
+        let mut asks = vec![Some(2.2); 10];
+        asks[3] = None;
+        columns[6].1 = Arc::new(Float64Array::from(asks));
+        columns.push((
+            "unused_payload",
+            Arc::new(StringArray::from(vec!["ignored"; 10])),
+        ));
+        write_parquet(&path, columns);
+        let oi = HashMap::from([
+            ((100_000, "CALL".into()), 0),
+            ((102_000, "CALL".into()), 25),
+        ]);
+        let quotes = read_option_quotes(
+            &path,
+            "TEST",
+            DATE,
+            NaiveDate::parse_from_str(EXPIRATION, "%Y-%m-%d").unwrap(),
+            MINUTE,
+            &oi,
+        )
+        .unwrap();
+        assert_eq!(
+            quotes
+                .iter()
+                .map(|quote| (quote.strike, quote.right.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(100.0, "CALL"), (100.0, "PUT"), (102.0, "CALL")]
+        );
+        assert!(quotes[0].bid.is_nan());
+        assert_eq!(quotes[0].ask, 2.2);
+        assert_eq!(quotes[0].bid_size, 0);
+        assert_eq!(quotes[0].ask_size, 20);
+        assert!(quotes[1].ask.is_nan());
+        assert_eq!(quotes[1].bid, 2.0);
+        assert_eq!(quotes[1].ask_size, 0);
+        assert_eq!(
+            quotes
+                .iter()
+                .map(|quote| quote.open_interest)
+                .collect::<Vec<_>>(),
+            vec![0, 0, 25]
+        );
+        assert!((open_interest_coverage(&quotes, &oi) - 200.0 / 3.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn parquet_minute_filter_uses_the_requested_et_date_and_dst_offset() {
+        let fixture = ReplayFixture::new();
+        let path = fixture.store.root().join("dst-filter.parquet");
+        for (date, minute, expected_utc) in [
+            ("2026-03-06", "09:31", "2026-03-06T14:31:00Z"),
+            ("2026-03-09", "09:31", "2026-03-09T13:31:00Z"),
+            ("2026-10-30", "09:31", "2026-10-30T13:31:00Z"),
+            ("2026-11-02", "09:31", "2026-11-02T14:31:00Z"),
+            ("2026-07-10", "23:59", "2026-07-11T03:59:00Z"),
+        ] {
+            let expected = DateTime::parse_from_rfc3339(expected_utc)
+                .unwrap()
+                .timestamp_micros();
+            write_parquet(
+                &path,
+                quote_columns(
+                    vec![
+                        Some(expected - 3_600_000_000),
+                        Some(expected),
+                        Some(expected + 3_600_000_000),
+                    ],
+                    vec![99.0, 100.0, 101.0],
+                ),
+            );
+            let quotes = read_option_quotes(
+                &path,
+                "TEST",
+                date,
+                NaiveDate::parse_from_str(EXPIRATION, "%Y-%m-%d").unwrap(),
+                minute,
+                &HashMap::new(),
+            )
+            .unwrap();
+            assert_eq!(quotes.len(), 1, "{date} {minute}");
+            assert_eq!(quotes[0].strike, 100.0, "{date} {minute}");
+        }
+    }
+
+    #[test]
+    fn parquet_minute_filter_validates_required_columns_even_when_no_rows_match() {
+        let fixture = ReplayFixture::new();
+        let path = fixture.store.root().join("schema-filter.parquet");
+        let timestamp = replay_as_of(DATE, "10:00").unwrap().timestamp_micros();
+        let expiry = NaiveDate::parse_from_str(EXPIRATION, "%Y-%m-%d").unwrap();
+        for missing in [
+            "timestamp",
+            "strike",
+            "right",
+            "bid_size",
+            "ask_size",
+            "bid",
+            "ask",
+        ] {
+            let mut columns = quote_columns(vec![Some(timestamp)], vec![100.0]);
+            columns.retain(|(name, _)| *name != missing);
+            write_parquet(&path, columns);
+            let error = read_option_quotes(&path, "TEST", DATE, expiry, MINUTE, &HashMap::new())
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("missing parquet column {missing}")),
+                "{error}"
+            );
+        }
+        let invalid_timestamps: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(vec![timestamp])),
+            Arc::new(arrow_array::TimestampMillisecondArray::from(vec![
+                timestamp / 1_000,
+            ])),
+            Arc::new(arrow_array::TimestampNanosecondArray::from(vec![
+                timestamp * 1_000,
+            ])),
+        ];
+        for timestamps in invalid_timestamps {
+            let mut columns = quote_columns(vec![Some(timestamp)], vec![100.0]);
+            columns[0].1 = timestamps;
+            write_parquet(&path, columns);
+            let error = read_option_quotes(&path, "TEST", DATE, expiry, MINUTE, &HashMap::new())
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("unexpected parquet type for timestamp"),
+                "{error}"
+            );
+        }
+
+        write_parquet(&path, quote_columns(vec![Some(timestamp)], vec![100.0]));
+        assert!(
+            read_option_quotes(&path, "TEST", DATE, expiry, MINUTE, &HashMap::new())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn parquet_minute_filter_accepts_all_supported_right_string_types() {
+        let fixture = ReplayFixture::new();
+        let path = fixture.store.root().join("right-types.parquet");
+        let timestamp = replay_as_of(DATE, MINUTE).unwrap().timestamp_micros();
+        let expiry = NaiveDate::parse_from_str(EXPIRATION, "%Y-%m-%d").unwrap();
+        let rights: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(vec!["put"])),
+            Arc::new(StringViewArray::from(vec!["put"])),
+            Arc::new(LargeStringArray::from(vec!["put"])),
+        ];
+        for right in rights {
+            let mut columns = quote_columns(vec![Some(timestamp)], vec![100.0]);
+            columns[2].1 = right;
+            // Projection uses field names and tolerates unrelated/reordered fields.
+            columns.reverse();
+            write_parquet(&path, columns);
+            let quotes =
+                read_option_quotes(&path, "TEST", DATE, expiry, MINUTE, &HashMap::new()).unwrap();
+            assert_eq!(quotes.len(), 1);
+            assert_eq!(quotes[0].right, "PUT");
+            assert_eq!(quotes[0].bid, 2.0);
+            assert_eq!(quotes[0].ask_size, 20);
+        }
+    }
+
+    fn assert_gex_blocked(chain: &ChainSnapshot, coverage: f64) {
+        assert_eq!(chain.rows.len(), 2);
+        assert_eq!(chain.quality.metadata_coverage_pct, coverage);
+        assert!(!chain.quality.gex_ready);
+        assert_eq!(chain.metrics.net_gex, None);
+        assert_eq!(chain.metrics.call_oi, None);
+        assert_eq!(chain.metrics.put_oi, None);
+        assert!(chain.rows.iter().all(|row| row.gex.is_none()));
+        assert!(chain.dealer_scenarios.is_empty());
+        assert!(chain.gex_by_strike.is_empty());
+        assert!(
+            chain
+                .quality
+                .blocked_metrics
+                .iter()
+                .any(|metric| metric == "net_gex")
+        );
+    }
+
+    #[test]
+    fn missing_oi_does_not_borrow_another_days_metadata() {
+        let fixture = ReplayFixture::new();
+        let complete = [(100.0, "CALL", Some(10)), (100.0, "PUT", Some(20))];
+        fixture.oi("2026-05-29", &complete);
+        fixture.oi("2026-06-02", &complete);
+        assert_gex_blocked(&fixture.chain(), 0.0);
+    }
+
+    #[test]
+    fn empty_or_null_oi_file_does_not_unlock_gex() {
+        for rows in [vec![], vec![(100.0, "CALL", None), (100.0, "PUT", None)]] {
+            let fixture = ReplayFixture::new();
+            fixture.oi(DATE, &rows);
+            assert_gex_blocked(&fixture.chain(), 0.0);
+        }
+    }
+
+    #[test]
+    fn oi_coverage_matches_quoted_contracts_and_counts_known_zero() {
+        let fixture = ReplayFixture::new();
+        fixture.oi(
+            DATE,
+            &[
+                (100.0, "CALL", Some(0)),
+                (100.0, "PUT", None),
+                (105.0, "CALL", Some(500)),
+            ],
+        );
+        let chain = fixture.chain();
+        assert_gex_blocked(&chain, 50.0);
+        let oi = fixture
+            .store
+            .open_interest("TEST", DATE, EXPIRATION)
+            .unwrap();
+        assert_eq!(oi.get(&(100_000, "CALL".into())), Some(&0));
+        assert!(!oi.contains_key(&(100_000, "PUT".into())));
+
+        // Repeated quotes for a known contract must not inflate its coverage.
+        let quotes = fixture
+            .store
+            .option_quotes("TEST", DATE, EXPIRATION, MINUTE)
+            .unwrap();
+        let mut repeated = quotes.as_ref().clone();
+        repeated.push(quotes[0].clone());
+        assert_eq!(open_interest_coverage(&repeated, &oi), 50.0);
+    }
+
+    #[test]
+    fn complete_oi_including_zero_unlocks_gex() {
+        let fixture = ReplayFixture::new();
+        fixture.oi(DATE, &[(100.0, "CALL", Some(0)), (100.0, "PUT", Some(25))]);
+        let chain = fixture.chain();
+        assert_eq!(chain.rows.len(), 2);
+        assert_eq!(chain.quality.metadata_coverage_pct, 100.0);
+        assert!(chain.quality.gex_ready);
+        assert_eq!(chain.metrics.call_oi, Some(0));
+        assert_eq!(chain.metrics.put_oi, Some(25));
+        assert!(chain.metrics.net_gex.is_some());
+        assert!(chain.quality.blocked_metrics.is_empty());
+        assert!(chain.rows.iter().all(|row| row.gex.is_some()));
+        assert_eq!(
+            chain
+                .rows
+                .iter()
+                .find(|row| row.right == "CALL")
+                .unwrap()
+                .gex,
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn invalid_oi_observations_are_not_metadata_coverage() {
+        let fixture = ReplayFixture::new();
+        fixture.oi(
+            DATE,
+            &[
+                (100.0, "CALL", Some(-1)),
+                (100.0, "PUT", None),
+                (f64::NAN, "CALL", Some(10)),
+                (f64::INFINITY, "CALL", Some(10)),
+                (0.0, "CALL", Some(10)),
+            ],
+        );
+        assert!(
+            fixture
+                .store
+                .open_interest("TEST", DATE, EXPIRATION)
+                .unwrap()
+                .is_empty()
+        );
+        assert_gex_blocked(&fixture.chain(), 0.0);
+    }
 
     #[test]
     fn historical_iv_never_looks_ahead_of_early_replay_time() {

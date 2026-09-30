@@ -48,6 +48,8 @@ supply chain are separate trust boundaries.
 - OAuth status responses expose only flow metadata and an authorization URL,
   never an access or refresh token;
 - credential-field rejection in audit payloads;
+- server-only LLM credentials, bounded assistant context and messages,
+  credential-like prompt rejection, and no assistant trade tools;
 - explicit request bounds and typed request models;
 - paper-account recognition, server enablement, freshness, and typed
   confirmation;
@@ -65,6 +67,8 @@ The project does not currently secure:
 - a compromised local OS or browser extension;
 - remote credential vault integration;
 - hostile provider or exchange infrastructure;
+- malicious or compromised LLM providers and prompt-injection resistance beyond
+  the frozen-context system policy;
 - real-money automated trading.
 
 Longbridge OAuth is provider authorization only; it does not authenticate users
@@ -77,4 +81,6 @@ security review.
 Paper trades can still fill partially or at unexpected prices. Provider account
 classification can change. Browser memory and process memory are readable by a
 compromised local account. Hash-chained audit files can be truncated or replaced
-without an external anchor. These limits must remain documented.
+without an external anchor. Assistant prompts and compact market contexts leave
+the machine when an external LLM is configured, and provider retention depends
+on that provider's policy. These limits must remain documented.
