@@ -10,6 +10,7 @@ import {
   Gauge,
   History,
   Layers3,
+  MoreHorizontal,
   KeyRound,
   LockKeyhole,
   MessageCircle,
@@ -19,6 +20,8 @@ import {
   Radio,
   RefreshCw,
   RotateCcw,
+  Save,
+  SlidersHorizontal,
   TableProperties,
   Wifi,
   WifiOff,
@@ -32,6 +35,7 @@ import { LiveReadout, Metric, Panel } from './components/Primitives'
 import StrategyWorkbench from './components/StrategyWorkbench'
 import { api, apiJson, websocketUrl } from './lib/api'
 import { createReplayController } from './lib/replay'
+import { chartRange, exposureSeries, WORKSPACE_VIEWS } from './lib/visualization'
 
 const SurfaceChart = lazy(() => import('./components/SurfaceChart'))
 const AssistantDock = lazy(() => import('./components/AssistantDock'))
@@ -50,7 +54,7 @@ function detectWebGL() {
 const axis = {
   axisLine: { lineStyle: { color: '#34414d' } },
   axisTick: { show: false },
-  axisLabel: { color: '#83909c', fontSize: 11 },
+  axisLabel: { color: '#9aaab7', fontSize: 12, hideOverlap: true },
   splitLine: { lineStyle: { color: '#1d2730' } },
 }
 
@@ -82,6 +86,9 @@ function App() {
   const [pricingMode, setPricingMode] = useState('micro')
   const [dealerModel, setDealerModel] = useState('classic')
   const [smileAxis, setSmileAxis] = useState('strike')
+  const [exposureMetric, setExposureMetric] = useState('gex')
+  const [surfaceView, setSurfaceView] = useState('2d')
+  const [surfaceScale, setSurfaceScale] = useState('auto')
   const [focusStrike, setFocusStrike] = useState(null)
   const [strategyLegs, setStrategyLegs] = useState([])
   const [strategyQuantity, setStrategyQuantity] = useState(1)
@@ -91,7 +98,12 @@ function App() {
   const [compareBookmark, setCompareBookmark] = useState(null)
   const [compareChain, setCompareChain] = useState(null)
   const [webgl] = useState(detectWebGL)
-  const [layout, setLayout] = useState(() => localStorage.getItem('option-workstation-layout') || 'dense')
+  const [layout, setLayout] = useState(() => {
+    const saved = localStorage.getItem('option-workstation-layout')
+    return Object.hasOwn(WORKSPACE_VIEWS, saved) ? saved : 'dense'
+  })
+  const workspaceView = WORKSPACE_VIEWS[layout]
+  const panels = workspaceView.panels
   const [workspaces, setWorkspaces] = useState(() => {
     try {
       const value = JSON.parse(localStorage.getItem('option-workstation-workspaces') || '[]')
@@ -643,12 +655,12 @@ function App() {
   }, [mode, activeSymbol, expiration, pricingMode, dealerModel, strategyQuantity, strategyLegs])
 
   const currentBars = useMemo(() => {
-    if (!session || displayedFrame < 0) return {}
+    if (!panels.has('market') || !session || displayedFrame < 0) return {}
     return Object.fromEntries(symbols.filter((symbol) => session.series[symbol]).map((symbol) => [symbol, session.series[symbol].bars.slice(0, displayedFrame + 1)]))
-  }, [session, symbols, displayedFrame])
+  }, [session, symbols, displayedFrame, panels])
 
   const marketOption = useMemo(() => {
-    if (!session || displayedFrame < 0) return null
+    if (!panels.has('market') || !session || displayedFrame < 0) return null
     const times = session.timeline.slice(0, displayedFrame + 1)
     if (symbols.length > 1) {
       return {
@@ -657,7 +669,7 @@ function App() {
         legend: { top: 8, right: 12, textStyle: { color: '#8d9aa5' } },
         grid: { left: 54, right: 24, top: 42, bottom: 38 },
         xAxis: { type: 'category', data: times, boundaryGap: false, ...axis },
-        yAxis: { type: 'value', scale: true, axisLabel: { formatter: '{value}%', color: '#83909c' }, ...axis },
+        yAxis: { ...axis, type: 'value', scale: true, axisLabel: { ...axis.axisLabel, formatter: '{value}%' } },
         series: symbols.map((symbol, index) => {
           const bars = currentBars[symbol] || []
           const base = bars[0]?.close || 1
@@ -671,7 +683,7 @@ function App() {
       tooltip: { trigger: 'axis', axisPointer: { type: 'cross' }, backgroundColor: '#111920', borderColor: '#34414d', textStyle: { color: '#dce5ec' } },
       grid: [{ left: 54, right: 24, top: 26, height: '64%' }, { left: 54, right: 24, top: '76%', height: '15%' }],
       xAxis: [{ type: 'category', data: times, boundaryGap: true, ...axis }, { type: 'category', gridIndex: 1, data: times, axisLabel: { color: '#83909c', fontSize: 11 }, axisLine: axis.axisLine }],
-      yAxis: [{ type: 'value', scale: true, ...axis }, { type: 'value', gridIndex: 1, splitNumber: 2, axisLabel: { show: false }, ...axis }],
+      yAxis: [{ type: 'value', scale: true, ...axis }, { ...axis, type: 'value', gridIndex: 1, splitNumber: 2, axisLabel: { show: false } }],
       dataZoom: [{ type: 'inside', xAxisIndex: [0, 1], start: Math.max(0, 100 - 18000 / Math.max(bars.length, 1)), end: 100 }],
       series: [
         { name: activeSymbol, type: 'candlestick', data: bars.map((bar) => [bar.open, bar.close, bar.low, bar.high]), itemStyle: { color: '#37c99b', color0: '#ef6673', borderColor: '#37c99b', borderColor0: '#ef6673' }, markLine: focusStrike ? { silent: true, symbol: 'none', label: { formatter: `${focusStrike}`, color: '#f1c75b' }, lineStyle: { color: '#f1c75b', type: 'dashed' }, data: [{ yAxis: focusStrike }] } : undefined },
@@ -679,72 +691,61 @@ function App() {
         { name: 'Volume', type: 'bar', xAxisIndex: 1, yAxisIndex: 1, data: bars.map((bar) => bar.volume), itemStyle: { color: '#334655' } },
       ],
     }
-  }, [session, symbols, activeSymbol, currentBars, displayedFrame, focusStrike])
+  }, [session, symbols, activeSymbol, currentBars, displayedFrame, focusStrike, panels])
 
   const smileOption = useMemo(() => {
-    if (!chain) return null
+    if (!panels.has('smile') || !chain) return null
     const xValue = (row) => smileAxis === 'delta' ? row.delta : (smileAxis === 'moneyness' ? row.log_moneyness : row.strike)
     const make = (right, color) => ({
-      name: right === 'CALL' ? 'Call IV' : 'Put IV', type: 'line', showSymbol: true, symbolSize: 5,
+      name: right === 'CALL' ? 'Call 报价' : 'Put 报价', type: 'scatter', symbolSize: 4,
       data: (chain.rows || []).filter((row) => row.right === right && row.moneyness >= 0.75 && row.moneyness <= 1.25 && row.quality_score >= 25).map((row) => [xValue(row), row.iv]),
-      lineStyle: { color, width: 1.8 }, itemStyle: { color },
+      itemStyle: { color, opacity: 0.8 },
     })
     const fitted = smileAxis !== 'delta' && chain.svi ? [{ name: 'SVI', type: 'line', showSymbol: false, data: (chain.svi.curve || []).map((row) => [smileAxis === 'strike' ? chain.forward * row.moneyness : Math.log(row.moneyness), row.iv]), lineStyle: { color: '#f1c75b', width: 2.1 } }] : []
-    return { animation: false, tooltip: { trigger: 'axis', backgroundColor: '#111920', borderColor: '#34414d' }, legend: { top: 4, right: 8, textStyle: { color: '#8d9aa5' } }, grid: { left: 52, right: 18, top: 36, bottom: 34 }, xAxis: { type: 'value', name: smileAxis === 'delta' ? 'Delta' : smileAxis === 'moneyness' ? 'ln(K/F)' : 'Strike', nameTextStyle: { color: '#778590' }, scale: true, ...axis }, yAxis: { type: 'value', name: 'IV %', nameTextStyle: { color: '#778590' }, scale: true, ...axis }, series: [make('CALL', '#54d6b6'), make('PUT', '#ff7e8a'), ...fitted] }
-  }, [chain, smileAxis])
+    return { animation: false, tooltip: { trigger: 'axis', backgroundColor: '#111920', borderColor: '#34414d' }, legend: { top: 4, right: 8, textStyle: { color: '#8d9aa5' } }, grid: { left: 52, right: 18, top: 36, bottom: 34 }, xAxis: { type: 'value', name: smileAxis === 'delta' ? 'Delta' : smileAxis === 'moneyness' ? 'ln(K/F)' : 'Strike', nameLocation: 'middle', nameGap: 23, nameTextStyle: { color: '#778590' }, scale: true, ...axis }, yAxis: { type: 'value', name: 'IV %', nameTextStyle: { color: '#778590' }, scale: true, ...axis }, series: [make('CALL', '#54d6b6'), make('PUT', '#ff7e8a'), ...fitted] }
+  }, [chain, smileAxis, panels])
 
-  const residualOption = useMemo(() => chain?.svi ? ({
-    animation: false, grid: { left: 45, right: 12, top: 18, bottom: 28 }, tooltip: { trigger: 'axis', backgroundColor: '#111920', borderColor: '#34414d' },
-    xAxis: { type: 'value', name: 'ln(K/F)', scale: true, ...axis }, yAxis: { type: 'value', name: 'IV Δ', ...axis },
+  const residualOption = useMemo(() => panels.has('residual') && chain?.svi ? ({
+    animation: false, grid: { left: 45, right: 18, top: 28, bottom: 42 }, tooltip: { trigger: 'axis', backgroundColor: '#111920', borderColor: '#34414d' },
+    xAxis: { type: 'value', name: 'ln(K/F)', nameLocation: 'middle', nameGap: 24, scale: true, ...axis }, yAxis: { type: 'value', name: 'IV Δ', ...axis },
     series: [{ type: 'bar', data: (chain.svi.residuals || []).map((row) => [row.k, row.residual]), itemStyle: { color: (params) => params.value[1] >= 0 ? '#37c99b' : '#ef6673' } }],
-  }) : null, [chain])
+  }) : null, [chain, panels])
 
-  const gexOption = useMemo(() => chain ? ({
-    animation: false, tooltip: { trigger: 'axis', backgroundColor: '#111920', borderColor: '#34414d' }, grid: { left: 68, right: 26, top: 24, bottom: 42 },
-    xAxis: { type: 'category', data: chain.gex_by_strike.map((row) => row.strike), axisLabel: { interval: 'auto', color: '#83909c' }, ...axis },
-    yAxis: { type: 'value', axisLabel: { formatter: (value) => formatCompact(value), color: '#83909c' }, ...axis },
-    series: [{ type: 'bar', data: chain.gex_by_strike.map((row) => ({ value: row.gex, itemStyle: { color: row.gex >= 0 ? '#37c99b' : '#ef6673' } })) }],
-  }) : null, [chain])
-
+  const exposureValues = useMemo(() => panels.has('exposure') ? exposureSeries(chain) : [], [chain, panels])
   const exposureOption = useMemo(() => {
-    if (!chain?.quality?.gex_ready) return null
-    const grouped = new Map()
-    ;(chain.rows || []).forEach((row) => {
-      const value = grouped.get(row.strike) || { strike: row.strike, gex: 0, vanna: 0, charm: 0 }
-      const sign = row.right === 'CALL' ? 1 : -1
-      value.gex += row.gex || 0
-      value.vanna += row.vanna * row.open_interest * 100 * sign
-      value.charm += row.charm * row.open_interest * 100 * sign
-      grouped.set(row.strike, value)
-    })
-    const values = [...grouped.values()].filter((row) => Math.abs(row.strike / chain.spot - 1) <= 0.12)
-    return { animation: false, tooltip: { trigger: 'axis', backgroundColor: '#111920', borderColor: '#34414d' }, legend: { top: 2, right: 6, textStyle: { color: '#8d9aa5' } }, grid: { left: 55, right: 18, top: 32, bottom: 32 }, xAxis: { type: 'category', data: values.map((row) => row.strike), ...axis }, yAxis: { type: 'value', axisLabel: { formatter: formatCompact, color: '#83909c' }, ...axis }, series: [
-      { name: 'GEX', type: 'bar', data: values.map((row) => row.gex), itemStyle: { color: '#54d6b6' } },
-      { name: 'Vanna', type: 'line', showSymbol: false, data: values.map((row) => row.vanna), lineStyle: { color: '#70a5ff' } },
-      { name: 'Charm', type: 'line', showSymbol: false, data: values.map((row) => row.charm), lineStyle: { color: '#ff7e8a' } },
+    if (!panels.has('exposure') || !chain?.quality?.gex_ready) return null
+    const metric = {
+      gex: { label: 'GEX · $ / 1% spot', color: '#54d6b6' },
+      vanna: { label: 'Vanna · Δ股数 / 1.00 IV', color: '#70a5ff' },
+      charm: { label: 'Charm · Δ股数 / 年', color: '#ff7e8a' },
+    }[exposureMetric]
+    return { animation: false, tooltip: { trigger: 'axis', backgroundColor: '#111920', borderColor: '#34414d' }, grid: { left: 70, right: 22, top: 40, bottom: 38 }, xAxis: { type: 'category', data: exposureValues.map((row) => row.strike), ...axis }, yAxis: { ...axis, type: 'value', name: metric.label, nameLocation: 'end', nameTextStyle: { color: '#a5b5c1', align: 'left' }, axisLabel: { formatter: formatCompact, color: '#9aaab7', fontSize: 12 } }, series: [
+      { name: metric.label, type: exposureMetric === 'gex' ? 'bar' : 'line', showSymbol: false, data: exposureValues.map((row) => row[exposureMetric]), itemStyle: { color: metric.color }, lineStyle: { color: metric.color, width: 2 }, markLine: { silent: true, symbol: 'none', label: { show: false }, data: [{ yAxis: 0 }], lineStyle: { color: '#596a77' } } },
     ] }
-  }, [chain])
+  }, [chain, panels, exposureMetric, exposureValues])
+  const exposureEvents = useMemo(() => ({ click: (params) => params.name && setFocusStrike(Number(params.name)) }), [])
 
-  const volOption = useMemo(() => volContext ? ({
+  const volOption = useMemo(() => panels.has('vol') && volContext ? ({
     animation: false, grid: { left: 42, right: 12, top: 18, bottom: 28 }, tooltip: { trigger: 'axis', backgroundColor: '#111920', borderColor: '#34414d' },
     xAxis: { type: 'category', data: (volContext.history || []).map((row) => row.date.slice(5)), ...axis }, yAxis: { type: 'value', scale: true, ...axis },
     series: [{ type: 'line', showSymbol: false, data: (volContext.history || []).map((row) => row.iv), lineStyle: { color: '#b395ff', width: 1.8 }, areaStyle: { color: 'rgba(179,149,255,.08)' } }],
-  }) : null, [volContext])
+  }) : null, [volContext, panels])
 
-  const surfaceOption = useMemo(() => !surface ? null : !webgl ? ({
+  const surfaceBounds = useMemo(() => panels.has('surface') ? chartRange(surface?.grid, surfaceScale === 'fixed', surfaceView === '3d' ? surface?.points || [] : []) : null, [surface, surfaceScale, surfaceView, panels])
+  const surfaceOption = useMemo(() => !panels.has('surface') || !surface ? null : surfaceView === '2d' || !webgl ? ({
     animation: false,
     tooltip: { position: 'top', backgroundColor: '#111920', borderColor: '#34414d' },
-    grid: { left: 58, right: 78, top: 20, bottom: 38 },
-    xAxis: { type: 'category', name: 'Moneyness', data: surface.grid?.[0]?.map((cell) => cell[0].toFixed(3)) || [], ...axis },
-    yAxis: { type: 'category', name: 'DTE', data: (surface.grid || []).map((row) => `${row[0][1]}D`), ...axis },
-    visualMap: { min: 10, max: 150, calculable: true, orient: 'vertical', right: 4, top: 20, textStyle: { color: '#8d9aa5' }, inRange: { color: ['#183c56', '#2b8f91', '#e3c65f', '#d95d6c'] } },
+    grid: { left: 60, right: 76, top: 40, bottom: 40 },
+    xAxis: { type: 'category', name: 'Moneyness', nameLocation: 'middle', nameGap: 24, data: surface.grid?.[0]?.map((cell) => cell[0].toFixed(3)) || [], ...axis },
+    yAxis: { ...axis, type: 'category', name: 'DTE', data: (surface.grid || []).map((row) => row[0][1]), axisLabel: { ...axis.axisLabel, formatter: (days) => `${Number(days).toFixed(Number(days) < 1 ? 2 : 1)}D` } },
+    visualMap: { ...surfaceBounds, calculable: true, orient: 'vertical', right: 4, top: 40, textStyle: { color: '#a5b5c1' }, inRange: { color: ['#183c56', '#2b8f91', '#e3c65f', '#d95d6c'] } },
     series: [{ type: 'heatmap', data: (surface.grid || []).flatMap((row, y) => row.map((cell, x) => [x, y, cell[2]])), emphasis: { itemStyle: { borderColor: '#dce5ec', borderWidth: 1 } } }],
   }) : ({
     animation: false, tooltip: {}, backgroundColor: 'transparent',
-    visualMap: { show: true, min: 10, max: Math.min(150, Math.max(...(surface.points || []).map((point) => point.iv), 80)), calculable: true, orient: 'horizontal', left: 20, bottom: 4, textStyle: { color: '#8d9aa5' }, inRange: { color: ['#183c56', '#2b8f91', '#e3c65f', '#d95d6c'] } },
+    visualMap: { show: true, ...surfaceBounds, calculable: true, orient: 'horizontal', left: 20, bottom: 4, textStyle: { color: '#a5b5c1' }, inRange: { color: ['#183c56', '#2b8f91', '#e3c65f', '#d95d6c'] } },
     xAxis3D: { type: 'value', name: 'Moneyness', min: 0.75, max: 1.25, axisLabel: { color: '#83909c' } },
     yAxis3D: { type: 'value', name: 'DTE', axisLabel: { color: '#83909c' } },
-    zAxis3D: { type: 'value', name: 'IV %', min: 0, max: 150, axisLabel: { color: '#83909c' } },
+    zAxis3D: { type: 'value', name: 'IV %', ...surfaceBounds, axisLabel: { color: '#9aaab7' } },
     grid3D: { boxWidth: 150, boxDepth: 90, environment: '#0d141a', axisLine: { lineStyle: { color: '#43515d' } }, splitLine: { lineStyle: { color: '#26313a' } }, viewControl: { distance: 190, alpha: 24, beta: 35 } },
     series: [
       {
@@ -761,20 +762,20 @@ function App() {
         name: 'Observed',
         type: 'scatter3D',
         symbolSize: 2.2,
-        data: (surface.points || []).filter((point, index) => index % 4 === 0 && point.iv <= 150).map((point) => [point.moneyness, point.tte_days, point.iv]),
+        data: (surface.points || []).map((point) => [point.moneyness, point.tte_days, point.iv]),
         itemStyle: { color: '#dce5ec', opacity: 0.34 },
       },
     ],
-  }), [surface, webgl])
+  }), [surface, webgl, surfaceView, surfaceBounds, panels])
 
-  const termOption = useMemo(() => surface ? ({
+  const termOption = useMemo(() => panels.has('term') && surface ? ({
     animation: false,
     tooltip: { trigger: 'axis', backgroundColor: '#111920', borderColor: '#34414d' },
     grid: { left: 58, right: 26, top: 28, bottom: 42 },
     xAxis: { type: 'category', data: (surface.term || []).map((point) => `${point.dte}D`), ...axis },
     yAxis: [{ type: 'value', name: 'ATM IV %', nameTextStyle: { color: '#778590' }, scale: true, ...axis }, { type: 'value', name: 'GEX', axisLabel: { formatter: formatCompact, color: '#83909c' }, splitLine: { show: false } }],
     series: [{ name: 'ATM IV', type: 'line', data: (surface.term || []).map((point) => point.iv), showSymbol: true, symbolSize: 6, lineStyle: { color: '#70a5ff', width: 2 }, itemStyle: { color: '#70a5ff' }, areaStyle: { color: 'rgba(112,165,255,.10)' } }, { name: 'Expiry GEX', type: 'bar', yAxisIndex: 1, data: (surface.term || []).map((point) => point.net_gex), itemStyle: { color: 'rgba(84,214,182,.3)' } }],
-  }) : null, [surface])
+  }) : null, [surface, panels])
 
   const liveStrategyLegs = useMemo(() => strategyLegs.map((leg) => {
     const current = chain?.rows.find((row) => row.strike === leg.strike && row.right === leg.right)
@@ -784,7 +785,7 @@ function App() {
   const payoffOption = useMemo(() => {
     const payoff = strategyAnalysis?.payoff
     if (!payoff?.length) return null
-    return { animation: false, grid: { left: 52, right: 14, top: 18, bottom: 30 }, tooltip: { trigger: 'axis', backgroundColor: '#111920', borderColor: '#34414d' }, xAxis: { type: 'category', data: payoff.map((row) => row[0]), ...axis }, yAxis: { type: 'value', axisLabel: { formatter: formatCompact, color: '#83909c' }, ...axis }, series: [{ type: 'line', showSymbol: false, data: payoff.map((row) => row[1]), lineStyle: { color: '#f1c75b', width: 2 }, areaStyle: { color: 'rgba(241,199,91,.08)' }, markLine: { symbol: 'none', data: [{ yAxis: 0 }], lineStyle: { color: '#56636e' } } }] }
+    return { animation: false, grid: { left: 52, right: 14, top: 18, bottom: 30 }, tooltip: { trigger: 'axis', backgroundColor: '#111920', borderColor: '#34414d' }, xAxis: { type: 'category', data: payoff.map((row) => row[0]), ...axis }, yAxis: { ...axis, type: 'value', axisLabel: { ...axis.axisLabel, formatter: formatCompact } }, series: [{ type: 'line', showSymbol: false, data: payoff.map((row) => row[1]), lineStyle: { color: '#f1c75b', width: 2 }, areaStyle: { color: 'rgba(241,199,91,.08)' }, markLine: { symbol: 'none', data: [{ yAxis: 0 }], lineStyle: { color: '#56636e' } } }] }
   }, [strategyAnalysis])
 
   const compareMetrics = useMemo(() => {
@@ -954,7 +955,7 @@ function App() {
     setExpiration(workspace.expiration || '')
     setPricingMode(workspace.pricingMode || 'micro')
     setDealerModel(workspace.dealerModel || 'classic')
-    setLayout(workspace.layout || 'dense')
+    setLayout(Object.hasOwn(WORKSPACE_VIEWS, workspace.layout) ? workspace.layout : 'dense')
     setSmileAxis(workspace.smileAxis || 'strike')
     setStrategyLegs(Array.isArray(workspace.strategyLegs) ? workspace.strategyLegs : [])
     setStrategyQuantity(workspace.strategyQuantity || 1)
@@ -962,10 +963,10 @@ function App() {
     if (workspace.mode === 'live') pendingWorkspaceFrameRef.current = null
     if (workspace.mode === 'live') setLiveSymbolDraft(workspace.activeSymbol || 'SPY')
   }
-  const addStrategyLeg = (row) => {
+  const addStrategyLeg = useCallback((row) => {
     setStrategyLegs((current) => current.some((leg) => leg.strike === row.strike && leg.right === row.right) ? current : [...current, { symbol: row.symbol, strike: row.strike, right: row.right, side: 'BUY', ratio: 1 }])
     setFocusStrike(row.strike)
-  }
+  }, [])
   const applyPreset = (preset) => {
     if (!chain?.rows?.length) return
     const find = (right, target) => chain.rows.filter((row) => row.right === right).sort((a, b) => Math.abs(a.strike - target) - Math.abs(b.strike - target))[0]
@@ -1033,43 +1034,61 @@ function App() {
   return (
     <div className="app-shell">
       <header className="topbar">
-        <div className="brand"><Activity size={20} /><strong>Option Workstation</strong><span>Rust Analytics</span></div>
+        <div className="brand"><Activity size={20} aria-hidden="true" /><strong>Option Workstation</strong><span>Rust Analytics</span></div>
         <div className="session-controls">
-          <div className="segments mode-switch" aria-label="数据模式">
-            <button className={mode === 'replay' ? 'active' : ''} onClick={() => switchMode('replay')} title="历史回放"><History size={13} />历史</button>
-            <button className={mode === 'live' ? 'active' : ''} onClick={() => switchMode('live')} title="实时工作台"><Radio size={13} />实时</button>
-          </div>
-          {mode === 'replay' ? <>
-            <div className="symbol-strip">
-              {symbols.map((symbol, index) => <button key={symbol} className={`symbol-chip ${activeSymbol === symbol ? 'active' : ''}`} style={{ '--accent': PALETTE[index] }} onClick={() => setActiveSymbol(symbol)}>{symbol}{symbols.length > 1 && <X size={13} onClick={(event) => { event.stopPropagation(); removeSymbol(symbol) }} />}</button>)}
-              <label className="icon-button" title="添加标的"><Plus size={16} /><select value="" onChange={(event) => addSymbol(event.target.value)}><option value="">添加</option>{catalog?.symbols.filter((symbol) => !symbols.includes(symbol)).map((symbol) => <option key={symbol}>{symbol}</option>)}</select></label>
+          <div className="context-controls">
+            <div className="segments mode-switch" aria-label="数据模式">
+              <button aria-pressed={mode === 'replay'} className={mode === 'replay' ? 'active' : ''} onClick={() => switchMode('replay')}><History size={14} />历史</button>
+              <button aria-pressed={mode === 'live'} className={mode === 'live' ? 'active' : ''} onClick={() => switchMode('live')}><Radio size={14} />实时</button>
             </div>
-            <select className="date-select" value={tradingDate} onChange={(event) => setTradingDate(event.target.value)}>{catalog?.common_dates.map((item) => <option key={item}>{item}</option>)}</select>
-          </> : <label className="live-symbol-control" title="实时美股代码"><span>US</span><input list="live-symbols" value={liveSymbolDraft} maxLength={15} onChange={(event) => setLiveSymbolDraft(event.target.value.toUpperCase())} onKeyDown={(event) => event.key === 'Enter' && startLive()} aria-label="实时美股代码" /><datalist id="live-symbols">{catalog?.symbols.map((symbol) => <option key={symbol} value={symbol} />)}</datalist></label>}
-          {mode === 'live' && <div className="segments provider-switch" aria-label="实时数据源"><button className={liveProvider === 'longbridge' ? 'active' : ''} onClick={() => selectLiveProvider('longbridge')}>Longbridge</button><button className={liveProvider === 'thetadata' ? 'active' : ''} onClick={() => selectLiveProvider('thetadata')}>ThetaData</button></div>}
-          <select className="date-select compact" value={pricingMode} onChange={(event) => setPricingMode(event.target.value)}><option value="micro">Micro</option><option value="mid">Mid</option><option value="ask">Ask</option></select>
-          <select className="date-select compact" value={dealerModel} onChange={(event) => setDealerModel(event.target.value)}><option value="classic">Call+/Put-</option><option value="short_all">Dealer Short</option><option value="long_all">Dealer Long</option></select>
-          <div className="segments layout-switch" aria-label="工作台布局">{[['dense', '总览'], ['vol', '波动率'], ['trade', '交易']].map(([value, label]) => <button key={value} className={layout === value ? 'active' : ''} onClick={() => setLayout(value)}>{label}</button>)}</div>
-          <select className="workspace-select" value={workspaceId} onChange={(event) => restoreWorkspace(event.target.value)} title="恢复研究工作区"><option value="">工作区</option>{workspaces.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select>
-          <button className="icon-button action" title="保存研究工作区" onClick={saveWorkspace}><Bookmark size={15} /></button>
-          <a className="icon-button action" href="/guide.html" title="打开初学者指南" aria-label="打开初学者指南"><BookOpen size={15} /></a>
-          <button className="icon-button action" title="写入审计账本" onClick={() => captureAudit()}><Bookmark size={15} /></button>
-          <button className="icon-button action" title="导出研究快照" onClick={exportSnapshot}><Download size={15} /></button>
+            {mode === 'replay' ? <>
+              <div className="symbol-strip">
+                {symbols.map((symbol, index) => <div className="symbol-token" key={symbol}><button className={`symbol-chip ${activeSymbol === symbol ? 'active' : ''}`} style={{ '--accent': PALETTE[index] }} aria-pressed={activeSymbol === symbol} onClick={() => setActiveSymbol(symbol)}>{symbol}</button>{symbols.length > 1 && <button className="symbol-remove" aria-label={`移除 ${symbol}`} onClick={() => removeSymbol(symbol)}><X size={13} /></button>}</div>)}
+                <label className="icon-button" title="添加标的"><Plus size={16} aria-hidden="true" /><select aria-label="添加标的" value="" onChange={(event) => addSymbol(event.target.value)}><option value="">添加</option>{catalog?.symbols.filter((symbol) => !symbols.includes(symbol)).map((symbol) => <option key={symbol}>{symbol}</option>)}</select></label>
+              </div>
+              <select className="date-select" aria-label="回放日期" value={tradingDate} onChange={(event) => setTradingDate(event.target.value)}>{catalog?.common_dates.map((item) => <option key={item}>{item}</option>)}</select>
+            </> : <label className="live-symbol-control" title="实时美股代码"><span>US</span><input list="live-symbols" value={liveSymbolDraft} maxLength={15} onChange={(event) => setLiveSymbolDraft(event.target.value.toUpperCase())} onKeyDown={(event) => event.key === 'Enter' && startLive()} aria-label="实时美股代码" /><datalist id="live-symbols">{catalog?.symbols.map((symbol) => <option key={symbol} value={symbol} />)}</datalist></label>}
+            {mode === 'live' && <div className="segments provider-switch" aria-label="实时数据源"><button aria-pressed={liveProvider === 'longbridge'} className={liveProvider === 'longbridge' ? 'active' : ''} onClick={() => selectLiveProvider('longbridge')}>Longbridge</button><button aria-pressed={liveProvider === 'thetadata'} className={liveProvider === 'thetadata' ? 'active' : ''} onClick={() => selectLiveProvider('thetadata')}>ThetaData</button></div>}
+          </div>
+          <details className="analysis-controls">
+            <summary><SlidersHorizontal size={14} />定价设置</summary>
+            <div className="analysis-options">
+              <label>报价口径<select className="date-select" aria-label="报价口径" value={pricingMode} onChange={(event) => setPricingMode(event.target.value)}><option value="micro">Micro · 微价格</option><option value="mid">Mid · 中间价</option><option value="ask">Ask · 卖价</option></select></label>
+              <label>Dealer 假设<select className="date-select" aria-label="Dealer 假设" value={dealerModel} onChange={(event) => setDealerModel(event.target.value)}><option value="classic">Call+ / Put−</option><option value="short_all">全部空头</option><option value="long_all">全部多头</option></select></label>
+            </div>
+          </details>
+        </div>
+        <div className="toolbar-actions">
           <button className={`connection-button ${selectedConnection.connected ? 'connected' : ''}`} onClick={() => setCredentialOpen(true)} title={`${liveProvider === 'thetadata' ? 'ThetaData' : 'Longbridge'} 连接设置`}>{selectedConnection.connected ? <Wifi size={14} /> : <WifiOff size={14} />}<span>{selectedConnection.connected ? selectedConnection.account_hint || '已连接' : liveProvider === 'thetadata' ? 'ThetaData' : 'Longbridge'}</span></button>
-          {mode === 'live' && <button className="live-run" onClick={() => startLive()} disabled={loading} title="启动或更新实时订阅"><Radio size={14} />{liveSwitch?.status === 'queued' ? `${liveSwitch.symbol} 排队中` : liveFeed ? '更新订阅' : '启动实时'}</button>}
+          {mode === 'live' && <button className="live-run" onClick={() => startLive()} disabled={loading}><Radio size={14} />{liveSwitch?.status === 'queued' ? `${liveSwitch.symbol} 排队中` : liveFeed ? '更新订阅' : '启动实时'}</button>}
+          <details className="action-menu">
+            <summary><MoreHorizontal size={16} />更多</summary>
+            <div className="action-menu-items">
+              <label>已存工作区<select className="workspace-select" aria-label="恢复研究工作区" value={workspaceId} onChange={(event) => restoreWorkspace(event.target.value)}><option value="">选择工作区</option>{workspaces.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
+              <button onClick={saveWorkspace}><Save size={15} />保存工作区</button>
+              <button onClick={() => captureAudit()}><Bookmark size={15} />记录研究快照</button>
+              <button onClick={exportSnapshot}><Download size={15} />导出快照</button>
+              <a href="/guide.html"><BookOpen size={15} />使用指南</a>
+            </div>
+          </details>
         </div>
       </header>
+      <nav className="layout-nav" aria-label="研究工作区">
+        <div className="workspace-heading"><strong>{workspaceView.label}</strong><span>{workspaceView.description}</span></div>
+        <div className="segments layout-switch">{Object.entries(WORKSPACE_VIEWS).map(([value, view]) => <button key={value} aria-pressed={layout === value} className={layout === value ? 'active' : ''} onClick={() => setLayout(value)}>{view.label}</button>)}</div>
+      </nav>
 
       <main className={`research-workspace layout-${layout}`}>
-        <section className="workspace-panel market-panel">
+        {panels.has('market') && <section className="workspace-panel market-panel">
           <div className="market-heading"><div><span className="eyebrow">{activeSymbol} · {mode === 'live' ? `${liveProvider === 'thetadata' ? 'THETADATA POLL' : 'LONGBRIDGE LIVE'}` : tradingDate}</span><h1>{activeBar ? activeBar.close.toFixed(2) : '--'} <small>{minute || '--:--'} ET</small></h1></div><div className="ohlc"><span>O <b>{activeBar?.open.toFixed(2)}</b></span><span>H <b>{activeBar?.high.toFixed(2)}</b></span><span>L <b>{activeBar?.low.toFixed(2)}</b></span><span>V <b>{formatCompact(activeBar?.volume)}</b></span></div></div>
           <Chart option={marketOption} className="market-chart" viewKey={marketViewKey} />
-        </section>
+        </section>}
 
         <aside className="workspace-panel snapshot-panel">
-          <div className="panel-title"><span>期权截面 <small>{chain?.provenance?.source || '--'}</small></span><select value={mode === 'live' ? pendingLiveExpiration || expiration : expiration} onChange={(event) => changeExpiration(event.target.value)}>{session?.series[activeSymbol]?.expirations.map((item) => <option key={item} value={item}>{item} · {Math.max(0, Math.round((new Date(`${item}T16:00:00`) - new Date(`${tradingDate}T09:30:00`)) / 86400000))}D</option>)}</select></div>
-          <div className={`quality-banner ${chainQualityReady ? 'ready' : 'limited'}`}><span>{chainQualityLabel}</span><b>Q {chain?.quality?.quote_coverage_pct?.toFixed(0) ?? '--'} · Fresh {chain?.quality?.fresh_quote_coverage_pct?.toFixed(0) ?? '--'} · Meta {chain?.quality?.metadata_coverage_pct?.toFixed(0) ?? '--'}%</b></div>
-          <div className="snapshot-provenance" title="所有主分析面板使用同一截面快照"><span>Snapshot {snapshotMeta?.snapshot_id?.slice(0, 14) || chain?.snapshot_id?.slice(0, 14) || '--'}</span><span>{snapshotMeta?.model_version || chain?.provenance?.model || '--'}</span><span>{snapshotMeta?.as_of ? new Date(snapshotMeta.as_of).toLocaleTimeString('zh-CN', { hour12: false, timeZone: 'America/New_York' }) : '--:--:--'} ET</span></div>
+          <div className="panel-title"><span>期权截面 <small>{activeSymbol} · {chain?.provenance?.source || '--'}</small></span><select aria-label="期权到期日" value={mode === 'live' ? pendingLiveExpiration || expiration : expiration} onChange={(event) => changeExpiration(event.target.value)}>{session?.series[activeSymbol]?.expirations.map((item) => <option key={item} value={item}>{item}</option>)}</select></div>
+          <div className={`quality-banner ${chainQualityReady ? 'ready' : 'limited'}`}><span>{chainQualityLabel}</span><b>报价 {chain?.quality?.quote_coverage_pct?.toFixed(0) ?? '--'}% · 新鲜 {chain?.quality?.fresh_quote_coverage_pct?.toFixed(0) ?? '--'}% · OI {chain?.quality?.metadata_coverage_pct?.toFixed(0) ?? '--'}%</b></div>
+          <div className="snapshot-clock"><span>截面时间 · ET</span><strong>{snapshotMeta?.as_of ? new Date(snapshotMeta.as_of).toLocaleTimeString('zh-CN', { hour12: false, timeZone: 'America/New_York' }) : '--:--:--'}</strong></div>
+          <details className="snapshot-details"><summary>数据与模型</summary><div className="snapshot-detail-grid"><span>日期</span><b>{chain?.date || '--'} · {chain?.dte ?? '--'} DTE</b><span>Snapshot</span><b>{snapshotMeta?.snapshot_id || chain?.snapshot_id || '--'}</b><span>模型</span><b>{snapshotMeta?.model_version || chain?.provenance?.model || '--'}</b><span>定价 / Dealer</span><b>{chain?.pricing_mode || pricingMode} · {chain?.dealer_model || dealerModel}</b></div></details>
           <div className="metric-grid">
             <Metric label="Spot" value={chain?.spot?.toFixed(2)} />
             <Metric label="ATM IV" value={chain?.metrics?.atm_iv ? `${chain.metrics.atm_iv.toFixed(1)}%` : '--'} />
@@ -1083,43 +1102,43 @@ function App() {
           <div className="oi-balance"><div><span>Call OI</span><b>{formatCompact(chain?.metrics?.call_oi)}</b></div><div><span>Put OI</span><b>{formatCompact(chain?.metrics?.put_oi)}</b></div><div className="balance-track"><i style={{ width: `${Math.min(100, (chain?.metrics?.call_oi || 0) / Math.max(1, (chain?.metrics?.call_oi || 0) + (chain?.metrics?.put_oi || 0)) * 100)}%` }} /></div></div>
         </aside>
 
-        <Panel id="volatility" className="vol-panel" title="波动率状态" icon={<Gauge size={14} />} tools={<span className={volContext?.status === 'ready' ? 'ok-text' : 'warning-text'}>{volContext?.status || 'loading'}</span>}>
-          <div className="compact-metrics"><Metric label="IV Rank" value={volContext?.iv_rank != null ? `${volContext.iv_rank.toFixed(1)}%` : '--'} detail={`Matched DTE samples: ${volContext?.sample_size ?? 0}`} /><Metric label="IV Percentile" value={volContext?.iv_percentile != null ? `${volContext.iv_percentile.toFixed(1)}%` : '--'} detail={volContext?.history_through ? `History through ${volContext.history_through}` : 'No matched-DTE history'} /><Metric label="RV20" value={volContext?.realized_volatility?.['20'] != null ? `${volContext.realized_volatility['20'].toFixed(1)}%` : '--'} detail={volContext?.rv_through ? `Close through ${volContext.rv_through}` : 'Daily close history unavailable'} /><Metric label="VRP20" value={volContext?.vrp20?.toFixed(2)} /><Metric label="Expected Move" value={volContext?.expected_move?.toFixed(2)} detail={volContext?.expected_move_basis || ''} /><Metric label="Snapshot" value={chain?.snapshot_id?.slice(0, 8)} /></div>
-          <div className="vol-provenance"><span>{volContext?.iv_source || '--'}</span><span>{volContext?.rv_source || '--'}</span><span>{volContext?.sample_size ?? 0} samples</span></div>
+        {panels.has('vol') && <Panel id="volatility" className="vol-panel" title="波动率状态" icon={<Gauge size={14} />} tools={<span className={volContext?.status === 'ready' ? 'ok-text' : 'warning-text'}>{volContext?.status || 'loading'}</span>}>
+          <div className="compact-metrics"><Metric label="IV Rank" value={volContext?.iv_rank != null ? `${volContext.iv_rank.toFixed(1)}%` : '--'} /><Metric label="IV Percentile" value={volContext?.iv_percentile != null ? `${volContext.iv_percentile.toFixed(1)}%` : '--'} /><Metric label="RV20" value={volContext?.realized_volatility?.['20'] != null ? `${volContext.realized_volatility['20'].toFixed(1)}%` : '--'} /><Metric label="VRP20" value={volContext?.vrp20?.toFixed(2)} /><Metric label="预期波幅" value={volContext?.expected_move?.toFixed(2)} /><Metric label="历史样本" value={volContext?.sample_size ?? '--'} /></div>
+          <div className="vol-provenance" title={`${volContext?.iv_source || ''} · ${volContext?.rv_source || ''} · ${volContext?.expected_move_basis || ''}`}><span>IV 截至 {volContext?.history_through || '--'}</span><span>收盘截至 {volContext?.rv_through || '--'}</span></div>
           <Chart option={volOption} viewKey={chartViewKey} />
-        </Panel>
+        </Panel>}
 
-        <Panel id="smile" className="smile-panel" title="IV 微笑与 SVI" icon={<Gauge size={14} />} tools={<div className="svi-toolbar"><span className={chain?.svi ? 'ok-text' : 'warning-text'}>{sviLabel}</span><div className="segments mini">{['strike', 'moneyness', 'delta'].map((item) => <button key={item} className={smileAxis === item ? 'active' : ''} onClick={() => setSmileAxis(item)}>{item === 'moneyness' ? 'ln(K/F)' : item}</button>)}</div></div>}>
-          <Chart option={smileOption} viewKey={chartViewKey} />
-        </Panel>
-        <Panel id="residual" className="residual-panel" title="SVI 残差 / 约束检查" icon={<Activity size={14} />} tools={<span className={chain?.svi?.butterfly_violations ? 'warning-text' : 'ok-text'}>BFLY {chain?.svi?.butterfly_violations ?? '--'}</span>}>
+        {panels.has('surface') && <Panel id="surface" className="surface-panel" title="约束 IV 曲面" icon={<Layers3 size={14} />} tools={<div className="surface-controls"><div className="segments mini view-switch" aria-label="曲面视图"><button aria-pressed={surfaceView === '2d'} className={surfaceView === '2d' ? 'active' : ''} onClick={() => setSurfaceView('2d')}>2D</button><button disabled={!webgl} title={webgl ? '旋转查看曲面' : '当前浏览器不支持 WebGL'} aria-pressed={surfaceView === '3d'} className={surfaceView === '3d' ? 'active' : ''} onClick={() => setSurfaceView('3d')}>3D</button></div><select aria-label="曲面色阶范围" value={surfaceScale} onChange={(event) => setSurfaceScale(event.target.value)}><option value="auto">自动范围</option><option value="fixed">固定 0–150%</option></select></div>}>
+          <div className="surface-warning" title={surface?.arbitrage?.warning || ''}>{surface?.arbitrage?.trusted ? 'Trusted' : 'Research'} {surface?.arbitrage?.confidence_score?.toFixed(0) ?? '--'} · C{surface?.arbitrage?.price_convexity_violations ?? '--'} · M{surface?.arbitrage?.price_monotonicity_violations ?? '--'}{surface?.arbitrage?.warning ? ` · ${surface.arbitrage.warning}` : ''}</div>
+          {webgl && surfaceView === '3d' ? <Suspense fallback={<div className="empty-state">加载 3D 渲染器…</div>}><SurfaceChart option={surfaceOption} viewKey={chartViewKey} /></Suspense> : <Chart option={surfaceOption} viewKey={chartViewKey} />}
+        </Panel>}
+        {panels.has('smile') && <Panel id="smile" className="smile-panel" title="IV 微笑与 SVI" icon={<Gauge size={14} />} tools={<div className="svi-toolbar"><span className={chain?.svi ? 'ok-text' : 'warning-text'}>{sviLabel}</span><div className="segments mini">{['strike', 'moneyness', 'delta'].map((item) => <button key={item} className={smileAxis === item ? 'active' : ''} onClick={() => setSmileAxis(item)}>{item === 'moneyness' ? 'ln(K/F)' : item}</button>)}</div></div>}>
+          <Chart option={smileOption} viewKey={`${chartViewKey}:${smileAxis}`} />
+        </Panel>}
+        {panels.has('residual') && <Panel id="residual" className="residual-panel" title="SVI 残差 / 约束检查" icon={<Activity size={14} />} tools={<span className={chain?.svi?.butterfly_violations ? 'warning-text' : 'ok-text'}>BFLY {chain?.svi?.butterfly_violations ?? '--'}</span>}>
           {residualOption ? <Chart option={residualOption} viewKey={chartViewKey} /> : <div className="empty-state">{chain?.svi_diagnostics?.reason || '等待足够的 OTM 报价后拟合 SVI'}</div>}
-        </Panel>
-        <Panel id="term" className="term-panel" title="期限结构" icon={<Activity size={14} />} tools={<span className={surface?.arbitrage?.calendar_violations ? 'warning-text' : 'ok-text'}>CAL {surface?.arbitrage?.calendar_violations ?? '--'}</span>}>
+        </Panel>}
+        {panels.has('term') && <Panel id="term" className="term-panel" title="期限结构" icon={<Activity size={14} />} tools={<span className={surface?.arbitrage?.calendar_violations ? 'warning-text' : 'ok-text'}>CAL {surface?.arbitrage?.calendar_violations ?? '--'}</span>}>
           <Chart option={termOption} viewKey={chartViewKey} />
-        </Panel>
-        <Panel id="exposure" className="exposure-panel" title="Dealer Exposure" icon={<BarChart3 size={14} />} tools={<span className={chain?.quality?.gex_ready ? 'ok-text' : 'warning-text'}>{chain?.quality?.gex_ready ? 'OI ready' : 'OI blocked'}</span>}>
-          {exposureOption ? <Chart option={exposureOption} viewKey={chartViewKey} onEvents={{ click: (params) => params.name && setFocusStrike(Number(params.name)) }} /> : <div className="empty-state">OI 元数据覆盖不足，GEX / Vanna / Charm 暂停计算</div>}
-        </Panel>
-
-        <Panel id="surface" className="surface-panel" title="约束 IV 曲面" icon={<Layers3 size={14} />} tools={<span className={surface?.arbitrage?.trusted ? 'ok-text' : 'warning-text'}>{surface?.arbitrage?.trusted ? 'Trusted' : 'Research'} {surface?.arbitrage?.confidence_score?.toFixed(0) ?? '--'} · C{surface?.arbitrage?.price_convexity_violations ?? '--'} · M{surface?.arbitrage?.price_monotonicity_violations ?? '--'}</span>}>
-          {surface?.arbitrage?.warning && <div className="surface-warning">{surface.arbitrage.warning}</div>}
-          {webgl ? <Suspense fallback={<div className="empty-state">加载 3D 渲染器…</div>}><SurfaceChart option={surfaceOption} viewKey={chartViewKey} /></Suspense> : <Chart option={surfaceOption} incremental viewKey={chartViewKey} />}
-        </Panel>
-        <Panel id="strategy" className="strategy-panel" title="策略风险引擎" icon={<TableProperties size={14} />} tools={<button className="text-button" onClick={() => setStrategyLegs([])}>清空</button>}>
+        </Panel>}
+        {panels.has('strategy') && <Panel id="strategy" className="strategy-panel" title="策略风险引擎" icon={<TableProperties size={14} />} tools={<button className="text-button" onClick={() => setStrategyLegs([])}>清空</button>}>
           <StrategyWorkbench legs={liveStrategyLegs} setLegs={setStrategyLegs} analysis={strategyAnalysis} quantity={strategyQuantity} setQuantity={setStrategyQuantity} onAnalyze={analyzeCurrentStrategy} payoffOption={payoffOption} onPreset={applyPreset} tradeAccount={tradeAccount} onPaperSubmit={() => setPaperConfirmOpen(true)} analyzing={analyzing} paperEligible={mode === 'live' && liveProvider === 'longbridge'} />
-        </Panel>
+        </Panel>}
+        {panels.has('exposure') && <Panel id="exposure" className="exposure-panel" title="Dealer 暴露" icon={<BarChart3 size={14} />} tools={<div className="segments mini view-switch" aria-label="暴露指标">{[['gex', 'GEX'], ['vanna', 'Vanna'], ['charm', 'Charm']].map(([value, label]) => <button key={value} aria-pressed={exposureMetric === value} className={exposureMetric === value ? 'active' : ''} onClick={() => setExposureMetric(value)}>{label}</button>)}</div>}>
+          {exposureOption ? <Chart option={exposureOption} viewKey={`${chartViewKey}:${exposureMetric}`} onEvents={exposureEvents} /> : <div className="empty-state">OI 元数据覆盖不足，GEX / Vanna / Charm 暂停计算</div>}
+        </Panel>}
 
-        <Panel id="audit" className="audit-panel" title="研究审计账本" icon={<Bookmark size={14} />}>
+
+        {panels.has('audit') && <Panel id="audit" className="audit-panel" title="研究审计账本" icon={<Bookmark size={14} />}>
           <AuditPanel records={auditRecords} selectedId={compareBookmark?.id} onSelect={selectAudit} onCapture={() => captureAudit()} />
           {compareMetrics && <div className="compare-grid"><Metric label="Δ Spot" value={compareMetrics.spot.toFixed(2)} /><Metric label="Δ ATM IV" value={compareMetrics.atmIv.toFixed(2)} /><Metric label="Δ RR25" value={compareMetrics.rr25.toFixed(2)} /><Metric label="Δ Net GEX" value={formatCompact(compareMetrics.netGex)} /></div>}
-        </Panel>
-        <Panel id="execution" className="execution-panel" title="Paper 执行监控" icon={<LockKeyhole size={14} />} tools={<span className={tradeAccount?.execution_enabled ? 'ok-text' : 'warning-text'}>{tradeAccount?.execution_enabled ? 'Enabled' : 'Server locked'}</span>}>
+        </Panel>}
+        {panels.has('execution') && <Panel id="execution" className="execution-panel" title="Paper 执行监控" icon={<LockKeyhole size={14} />} tools={<span className={tradeAccount?.execution_enabled ? 'ok-text' : 'warning-text'}>{tradeAccount?.execution_enabled ? 'Enabled' : 'Server locked'}</span>}>
           <ExecutionPanel account={tradeAccount} orders={orders} onRefresh={refreshTrading} onCancel={cancelPaperOrder} />
-        </Panel>
-        <Panel id="chain" className="chain-panel" title="镜像期权链" icon={<TableProperties size={14} />} tools={<span className="muted-label">Q {chain?.quality?.usable_pct ?? '--'}% · {pricingMode}</span>}>
+        </Panel>}
+        {panels.has('chain') && <Panel id="chain" className="chain-panel" title="镜像期权链" icon={<TableProperties size={14} />} tools={<span className="muted-label">Q {chain?.quality?.usable_pct ?? '--'}% · {pricingMode}</span>}>
           <ChainTable chain={chain} onAdd={addStrategyLeg} onFocus={setFocusStrike} focusStrike={focusStrike} />
-        </Panel>
+        </Panel>}
       </main>
 
       {mode === 'replay' ? <footer className="playback-dock">
@@ -1129,7 +1148,7 @@ function App() {
           <button className="play" title={playing ? '暂停' : '播放'} onClick={() => setPlaying(!playing)}>{playing ? <Pause size={19} /> : <Play size={19} />}</button>
           <button title="下一帧" onClick={() => { setFrame(Math.min((session?.timeline.length || 1) - 1, frame + 1)); setPlaying(false) }}><ChevronRight size={19} /></button>
         </div>
-        <div className="timeline"><input type="range" min="0" max={Math.max(0, (session?.timeline.length || 1) - 1)} value={frame} onChange={(event) => { setFrame(Number(event.target.value)); setPlaying(false) }} /><div className="timeline-labels"><span>09:30</span><strong>{minute || '--:--'} ET</strong><span>16:00</span></div></div>
+        <div className="timeline"><input aria-label="回放进度" type="range" min="0" max={Math.max(0, (session?.timeline.length || 1) - 1)} value={frame} onChange={(event) => { setFrame(Number(event.target.value)); setPlaying(false) }} /><div className="timeline-labels"><span>09:30</span><strong>{minute || '--:--'} ET</strong><span>16:00</span></div></div>
         <div className="speed-control"><span>速度</span><div className="segments">{SPEEDS.map((item) => <button key={item} className={speed === item ? 'active' : ''} onClick={() => setSpeed(item)}>{item}×</button>)}</div></div>
       </footer> : <footer className="live-dock">
         <div className={`feed-health ${liveSocketState === 'streaming' ? 'healthy' : ''}`}>

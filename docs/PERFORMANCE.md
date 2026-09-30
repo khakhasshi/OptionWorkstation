@@ -50,3 +50,51 @@ adapter tests, Clippy, production builds, and API smoke checks. In-browser
 30x playback kept the main time and snapshot time equal as they advanced;
 pause and consecutive seeks to frames 150 and 5 settled on the final `09:35`
 snapshot. No live provider or order execution was used in this benchmark.
+
+## Visualization performance
+
+The visualization pass on 2026-09-30 compares the previous frontend at
+`bf5958f` with the new workspace UI. Browser checks used the same local
+release backend, SPY `2026-07-10`, expiration `2026-07-17`, micro pricing,
+classic dealer convention, and a 1280 x 800 viewport.
+
+| Observation | Before | After |
+| --- | ---: | ---: |
+| Mounted chart components in overview | 8 | 4 |
+| Mounted chain data rows at 09:35, default filters | 150 | 0 in overview; 16 in trading |
+| Inactive surface renderer in overview | Mounted | Absent |
+
+These are DOM/work-count measurements, not FPS or latency speedup claims.
+The 16-row count depends on viewport height and scroll position; the table
+keeps the same 150 filtered strikes and mounts a bounded visible window with
+six overscan rows per side. The data and the backend analytics are not sampled
+or reduced by this change.
+
+During a 30x replay in the trading workspace, the fully offscreen market chart
+stayed at option version 2 while the partially visible exposure chart advanced
+from version 3 to 66. The tape and snapshot both reached 10:38. Scrolling the
+market chart back into view applied the latest snapshot once (version 3),
+without replaying hidden intermediate renders. All chart consumers, including
+live mode, use this scheduling path. Live-provider throughput was not measured.
+
+The chart scheduler merges option/resize work into one pending animation
+frame, retains the latest input while hidden, and defers renderer creation
+until visible with usable dimensions. Callback bindings remain stable, and
+unmount cancels pending work. Interactive zoom and 3D camera state survive
+ordinary data updates; changing the chart's data context resets the view.
+
+The volatility workspace starts with a 2D heatmap. ECharts GL remains a
+separate on-demand bundle; it is still roughly 1 MB uncompressed when loaded.
+3D displays all supplied observations instead of the former every-fourth-point
+sample. Automatic bounds include the displayed data; the explicit fixed
+0-150% option supports comparable scales but may clip outliers. Auto bounds
+can change between frames, so use the fixed range for visual comparisons.
+
+Validation: 43 Rust tests, 27 frontend tests, two adapter tests, Clippy,
+production build, and API smoke checks passed. Interactive browser checks
+covered high-speed snapshot consistency, deferred hidden-chart updates,
+virtual-chain End/Home and repeated boundary keys, filter focus, adding a leg
+and obtaining a risk preview, 2D/3D switching, camera preservation, and
+responsive layouts. The browser smoke script was updated and syntax checked;
+interactive checks were performed through the in-app browser instead of
+executing that script. No provider connection or order execution was used.

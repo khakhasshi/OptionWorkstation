@@ -9,6 +9,13 @@ and releases use semantic versioning after the public API stabilizes.
 
 ### Added
 
+- Focused overview, volatility, trading, and records workspaces with readable
+  labels, grouped toolbar controls, expandable model metadata, and responsive
+  layouts that retain navigation and playback controls on narrow screens.
+- Separate GEX/Vanna/Charm views with explicit units, quote observations drawn
+  as scatter points against the SVI fit, and a default 2D volatility surface
+  with optional 3D and automatic or fixed color ranges.
+
 - Selectable ThetaData live market-data mode using one official Python SDK
   session, bounded snapshot polling, Rust analytics, and local WebSocket updates.
 - Process-memory-only ThetaData connection API, in-app provider selector,
@@ -24,6 +31,11 @@ and releases use semantic versioning after the public API stabilizes.
 
 ### Fixed
 
+- Vanna and Charm visualizations follow the snapshot's selected dealer
+  convention, including all-long and all-short scenarios.
+- Chart-specific number formats no longer get overwritten by shared axis
+  settings; grid panels can scroll vertically and shrink after window resizing.
+
 - Replay playback waits for each complete snapshot and commits the tape time,
   option chain, surface, and volatility context together. Slow requests reduce
   effective playback speed instead of leaving analytics on an old frame.
@@ -37,6 +49,13 @@ and releases use semantic versioning after the public API stabilizes.
   expiration.
 
 ### Performance
+
+- Inactive workspaces do not mount their charts or chain tables. The 3D
+  renderer loads only when requested; chart updates coalesce per animation
+  frame and pause outside the viewport while preserving zoom and camera views.
+- The mirrored option chain renders only the visible window and nearby rows,
+  with keyboard navigation, filtering, and strategy-leg selection preserved.
+  Browser measurements and their limits are recorded in `docs/PERFORMANCE.md`.
 
 - Replay filters Parquet timestamps before decoding the selected minute's
   quote columns, including the requested New York trading date.

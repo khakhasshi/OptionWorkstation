@@ -65,7 +65,7 @@ cargo test --locked --manifest-path rust-backend/Cargo.toml
 These cover model calculations, safety gates, redaction, and point-in-time
 helpers without provider data.
 
-### Replay Playback Tests
+### Frontend Behavior Tests
 
 ```bash
 cd frontend
@@ -74,7 +74,10 @@ npm test
 
 These use a controlled clock and deferred responses to exercise fast playback,
 slow requests, cancellation, and snapshot consistency without licensed data or
-provider credentials. They also run in CI and `make check`.
+provider credentials. The same suite covers chart scheduling (hidden updates,
+resize coalescing, disposal and stable event handlers), chain windowing and
+keyboard scroll targets, surface ranges, and exposure conventions. They also
+run in CI and `make check`.
 
 ### Legacy Python Tests
 
