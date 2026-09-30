@@ -66,7 +66,18 @@ try {
   await page.screenshot({ path: path.join(artifactDir, 'decision-lab.png') })
 
   await page.goto(`${baseUrl}/?mode=replay`, { waitUntil: 'networkidle2' })
-  await page.waitForSelector('a.icon-button[href="/guide.html"]', { timeout: 20_000 })
+  await page.waitForSelector('.action-menu > summary', { visible: true, timeout: 20_000 })
+  await page.click('.action-menu > summary')
+  const guideLink = '.action-menu[open] .action-menu-items a[href="/guide.html"]'
+  await page.waitForSelector(guideLink, { visible: true })
+  const guideLabel = await page.$eval(guideLink, (element) => element.textContent.trim())
+  if (guideLabel !== '使用指南') throw new Error(`unexpected guide link label: ${guideLabel}`)
+  await Promise.all([
+    page.waitForNavigation({ waitUntil: 'networkidle2' }),
+    page.click(guideLink),
+  ])
+  if (new URL(page.url()).pathname !== '/guide.html') throw new Error('guide link did not navigate to the guide')
+  await page.waitForSelector('h1')
 
   await page.setViewport({ width: 390, height: 844, deviceScaleFactor: 1 })
   await page.goto(`${baseUrl}/guide.html`, { waitUntil: 'networkidle2' })

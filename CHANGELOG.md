@@ -27,6 +27,13 @@ and releases use semantic versioning after the public API stabilizes.
 
 ### Fixed
 
+- Assistant replay and imported contexts exclude market bars after the frozen
+  snapshot time; streamed Chinese and emoji text survives split UTF-8 chunks.
+- Cached ThetaData quotes and connection status continue aging during stalled
+  polls, with idle WebSocket freshness updates and explicit missing-timestamp
+  blockers for live strategy previews.
+- Guide smoke navigation follows the grouped toolbar menu.
+
 - Vanna and Charm visualizations follow the snapshot's selected dealer
   convention, including all-long and all-short scenarios.
 - Chart-specific number formats no longer get overwritten by shared axis
@@ -65,6 +72,8 @@ and releases use semantic versioning after the public API stabilizes.
 
 ### Security
 
+- Updated frontend browser tooling dependencies to remove the current npm
+  audit findings while retaining the upstream React security updates.
 - Server-side rejection of paper orders priced from the market-data-only
   ThetaData provider.
 - ThetaData credentials are passed only to the local adapter process and are

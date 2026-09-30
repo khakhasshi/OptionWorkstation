@@ -962,9 +962,23 @@ async fn live_stream(
 }
 
 async fn stream_socket(socket: WebSocket, live: Arc<LiveManager>) {
+    stream_freshness_socket(socket, live.subscribe(), || live.snapshot()).await;
+}
+
+async fn stream_theta_socket(socket: WebSocket, live: Arc<ThetaLiveManager>) {
+    stream_freshness_socket(socket, live.subscribe(), || live.snapshot()).await;
+}
+
+async fn stream_freshness_socket<F, Fut>(
+    socket: WebSocket,
+    mut events: tokio::sync::broadcast::Receiver<u64>,
+    mut snapshot: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<models::LiveSnapshot>>,
+{
     let (mut sender, mut receiver) = socket.split();
-    let mut events = live.subscribe();
-    if let Ok(snapshot) = live.snapshot().await
+    if let Ok(snapshot) = snapshot().await
         && sender
             .send(Message::Text(
                 serde_json::to_string(&snapshot).unwrap().into(),
@@ -1007,7 +1021,7 @@ async fn stream_socket(socket: WebSocket, live: Arc<LiveManager>) {
         if elapsed < Duration::from_millis(200) {
             tokio::time::sleep(Duration::from_millis(200) - elapsed).await;
         }
-        let payload = match live.snapshot().await {
+        let payload = match snapshot().await {
             Ok(snapshot) => serde_json::to_string(&snapshot).unwrap(),
             Err(error) => json!({"kind": "live_error", "detail": error.to_string()}).to_string(),
         };
@@ -1016,45 +1030,6 @@ async fn stream_socket(socket: WebSocket, live: Arc<LiveManager>) {
         }
         last_sent = tokio::time::Instant::now();
         freshness_tick.reset();
-    }
-}
-
-async fn stream_theta_socket(socket: WebSocket, live: Arc<ThetaLiveManager>) {
-    let (mut sender, mut receiver) = socket.split();
-    let mut events = live.subscribe();
-    if let Ok(snapshot) = live.snapshot().await
-        && sender
-            .send(Message::Text(
-                serde_json::to_string(&snapshot).unwrap().into(),
-            ))
-            .await
-            .is_err()
-    {
-        return;
-    }
-    loop {
-        tokio::select! {
-            event = events.recv() => {
-                match event {
-                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-                let payload = match live.snapshot().await {
-                    Ok(snapshot) => serde_json::to_string(&snapshot).unwrap(),
-                    Err(error) => json!({"kind": "live_error", "detail": error.to_string()}).to_string(),
-                };
-                if sender.send(Message::Text(payload.into())).await.is_err() { break; }
-            }
-            message = receiver.next() => {
-                match message {
-                    Some(Ok(Message::Ping(value)))
-                        if sender.send(Message::Pong(value.clone())).await.is_err() => break,
-                    Some(Ok(Message::Ping(_))) => {}
-                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
-                    _ => {}
-                }
-            }
-        }
     }
 }
 
@@ -1194,16 +1169,31 @@ mod live_stream_tests {
 
     #[tokio::test]
     async fn idle_longbridge_stream_heartbeats_and_exits_on_close() {
+        idle_stream_heartbeats_and_exits_on_close(false).await;
+    }
+
+    #[tokio::test]
+    async fn idle_theta_stream_heartbeats_and_exits_on_close() {
+        idle_stream_heartbeats_and_exits_on_close(true).await;
+    }
+
+    async fn idle_stream_heartbeats_and_exits_on_close(theta: bool) {
         let live = LiveManager::new(0.043);
+        let theta_live = ThetaLiveManager::new(0.043);
         let (completed_tx, mut completed_rx) = tokio::sync::mpsc::channel(1);
         let router = Router::new().route(
             "/stream",
             get(move |websocket: WebSocketUpgrade| {
                 let live = Arc::clone(&live);
+                let theta_live = Arc::clone(&theta_live);
                 let completed_tx = completed_tx.clone();
                 async move {
                     websocket.on_upgrade(move |socket| async move {
-                        stream_socket(socket, live).await;
+                        if theta {
+                            stream_theta_socket(socket, theta_live).await;
+                        } else {
+                            stream_socket(socket, live).await;
+                        }
                         let _ = completed_tx.send(()).await;
                     })
                 }

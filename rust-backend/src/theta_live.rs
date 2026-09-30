@@ -6,7 +6,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, anyhow};
@@ -241,10 +241,76 @@ struct ThetaClosesPayload {
     closes: Vec<ThetaClose>,
 }
 
+struct CachedThetaSnapshot {
+    snapshot: LiveSnapshot,
+    observed_at: DateTime<Utc>,
+    observed_instant: Instant,
+    underlying_at: Option<DateTime<Utc>>,
+    option_timestamps: Vec<Option<DateTime<Utc>>>,
+    selected_option_timestamps: Vec<Option<DateTime<Utc>>>,
+}
+
+impl CachedThetaSnapshot {
+    fn effective_now(&self, now: DateTime<Utc>, instant: Instant) -> DateTime<Utc> {
+        let elapsed_ms = instant
+            .saturating_duration_since(self.observed_instant)
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+        self.observed_at
+            .checked_add_signed(chrono::Duration::milliseconds(elapsed_ms))
+            .unwrap_or(DateTime::<Utc>::MAX_UTC)
+            .max(now)
+    }
+
+    fn at(&mut self, now: DateTime<Utc>, instant: Instant) -> LiveSnapshot {
+        // A read or heartbeat ages the original quote timestamps, without
+        // creating a provider update or recalculating the cached analytics.
+        let now = self.effective_now(now, instant);
+        self.observed_at = now;
+        self.observed_instant = instant;
+        let stale_after_ms = self.snapshot.feed.stale_after_ms.min(i64::MAX as u64) as i64;
+        let age = |timestamp: DateTime<Utc>| (now - timestamp).num_milliseconds().max(0);
+        let coverage = |timestamps: &[Option<DateTime<Utc>>]| {
+            let fresh = timestamps
+                .iter()
+                .filter(|timestamp| {
+                    timestamp.is_some_and(|timestamp| age(timestamp) <= stale_after_ms)
+                })
+                .count();
+            round(fresh as f64 / timestamps.len().max(1) as f64 * 100.0, 2)
+        };
+        let mut snapshot = self.snapshot.clone();
+        snapshot.chain.quality.spot_age_ms = self.underlying_at.map(age);
+        snapshot.chain.quality.fresh_quote_coverage_pct =
+            coverage(&self.selected_option_timestamps);
+        snapshot.feed.latency_ms = snapshot
+            .chain
+            .quality
+            .spot_age_ms
+            .unwrap_or_else(|| stale_after_ms.saturating_add(1));
+        snapshot.feed.fresh_quote_coverage_pct = coverage(&self.option_timestamps);
+        snapshot.feed.quality_state = if self.underlying_at.is_none() {
+            "missing_timestamp"
+        } else if snapshot.feed.quote_coverage_pct < 80.0 {
+            "degraded_quotes"
+        } else if snapshot.feed.latency_ms > stale_after_ms {
+            "stale_underlying"
+        } else if snapshot.feed.fresh_quote_coverage_pct < 80.0 {
+            "stale_options"
+        } else if snapshot.feed.metadata_coverage_pct < 90.0 {
+            "waiting_metadata"
+        } else {
+            "ready"
+        }
+        .into();
+        snapshot
+    }
+}
+
 #[derive(Default)]
 struct ThetaState {
     active: Option<LiveSessionRequest>,
-    latest: Option<LiveSnapshot>,
+    latest: Option<CachedThetaSnapshot>,
     status: ConnectionStatus,
 }
 
@@ -298,7 +364,10 @@ impl ThetaLiveManager {
     }
 
     pub async fn status(&self) -> ConnectionStatus {
-        self.state.read().await.status.clone()
+        let mut state = self.state.write().await;
+        // Status must age even if no WebSocket client is connected.
+        Self::project_snapshot(&mut state, Utc::now(), Instant::now());
+        state.status.clone()
     }
 
     pub async fn connect(
@@ -398,10 +467,10 @@ impl ThetaLiveManager {
             .await
             .latest
             .as_ref()
-            .map(|snapshot| snapshot.bars.clone())
+            .map(|cached| cached.snapshot.bars.clone())
             .unwrap_or_default();
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
-        let result = {
+        let result = async {
             let mut bridge = self.bridge.lock().await;
             let bridge = bridge
                 .as_mut()
@@ -416,29 +485,71 @@ impl ThetaLiveManager {
                 sequence,
             )
             .await
-        };
+        }
+        .await;
         match result {
             Ok(snapshot) => {
-                self.store_snapshot(request, snapshot.clone()).await;
+                let snapshot = self.store_snapshot(request, snapshot).await;
                 let _ = self.events.send(sequence);
                 Ok(snapshot)
             }
             Err(error) => {
-                let mut state = self.state.write().await;
-                state.status.switch_state = "error".into();
-                state.status.error = Some(error.to_string());
+                self.record_error(&error, true).await;
                 Err(error)
             }
         }
     }
 
     pub async fn snapshot(&self) -> anyhow::Result<LiveSnapshot> {
-        self.state
-            .read()
-            .await
-            .latest
-            .clone()
+        self.snapshot_at(Utc::now(), Instant::now()).await
+    }
+
+    async fn snapshot_at(
+        &self,
+        now: DateTime<Utc>,
+        instant: Instant,
+    ) -> anyhow::Result<LiveSnapshot> {
+        let mut state = self.state.write().await;
+        Self::project_snapshot(&mut state, now, instant)
             .ok_or_else(|| anyhow!("尚未建立 ThetaData 实时期权会话"))
+    }
+
+    fn project_snapshot(
+        state: &mut ThetaState,
+        now: DateTime<Utc>,
+        instant: Instant,
+    ) -> Option<LiveSnapshot> {
+        let mut snapshot = state.latest.as_mut()?.at(now, instant);
+        if state.status.error.is_some() && snapshot.feed.quality_state == "ready" {
+            snapshot.feed.quality_state = "provider_error".into();
+        }
+        state.status.latency_ms = Some(snapshot.feed.latency_ms);
+        if state.status.state != "connecting" {
+            state.status.state = if snapshot.feed.quality_state == "ready" {
+                "polling"
+            } else {
+                "degraded"
+            }
+            .into();
+        }
+        Some(snapshot)
+    }
+
+    async fn record_error(&self, error: &anyhow::Error, switching: bool) {
+        let mut state = self.state.write().await;
+        if !state.status.connected {
+            return;
+        }
+        state.status.state = "degraded".into();
+        state.status.error = Some(error.to_string());
+        if switching {
+            state.status.switch_state = "error".into();
+        }
+        // Error notifications are not quote updates. Readers retain the last
+        // provider sequence and age it while the next poll may still be stuck.
+        let _ = self
+            .events
+            .send(state.status.last_snapshot_sequence.unwrap_or(0));
     }
 
     pub async fn daily_closes(&self, count: usize) -> anyhow::Result<Vec<(String, f64)>> {
@@ -481,13 +592,7 @@ impl ThetaLiveManager {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
-                if let Err(error) = manager.refresh_snapshot().await {
-                    let mut state = manager.state.write().await;
-                    if state.status.connected && state.active.is_some() {
-                        state.status.state = "degraded".into();
-                        state.status.error = Some(error.to_string());
-                    }
-                }
+                let _ = manager.refresh_snapshot().await;
             }
         });
     }
@@ -504,10 +609,10 @@ impl ThetaLiveManager {
             .await
             .latest
             .as_ref()
-            .map(|snapshot| snapshot.bars.clone())
+            .map(|cached| cached.snapshot.bars.clone())
             .unwrap_or_default();
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
-        let snapshot = {
+        let result = async {
             let mut bridge = self.bridge.lock().await;
             let bridge = bridge
                 .as_mut()
@@ -521,28 +626,68 @@ impl ThetaLiveManager {
                 self.stale_after_ms,
                 sequence,
             )
-            .await?
-        };
-        self.store_snapshot(request, snapshot).await;
-        let _ = self.events.send(sequence);
-        Ok(())
+            .await
+        }
+        .await;
+        match result {
+            Ok(snapshot) => {
+                self.store_snapshot(request, snapshot).await;
+                let _ = self.events.send(sequence);
+                Ok(())
+            }
+            Err(error) => {
+                // Record the failure while session_setup is still held, so it
+                // cannot overwrite a newer successful session's status.
+                self.record_error(&error, false).await;
+                Err(error)
+            }
+        }
     }
 
-    async fn store_snapshot(&self, request: LiveSessionRequest, snapshot: LiveSnapshot) {
+    async fn store_snapshot(
+        &self,
+        request: LiveSessionRequest,
+        cached: CachedThetaSnapshot,
+    ) -> LiveSnapshot {
+        self.store_snapshot_at(request, cached, Utc::now(), Instant::now())
+            .await
+    }
+
+    async fn store_snapshot_at(
+        &self,
+        request: LiveSessionRequest,
+        mut cached: CachedThetaSnapshot,
+        now: DateTime<Utc>,
+        instant: Instant,
+    ) -> LiveSnapshot {
         let mut state = self.state.write().await;
+        // Preserve the effective clock across successful polls too: the SDK
+        // can return the same old quotes after the wall clock moved backward.
+        let now = state
+            .latest
+            .as_ref()
+            .map(|previous| previous.effective_now(now, instant))
+            .unwrap_or(now);
+        let snapshot = cached.at(now, instant);
         state.status.connected = true;
-        state.status.state = "polling".into();
+        state.status.state = if snapshot.feed.quality_state == "ready" {
+            "polling"
+        } else {
+            "degraded"
+        }
+        .into();
         state.status.switch_state = "ready".into();
         state.status.active_symbol = Some(snapshot.feed.symbol.clone());
         state.status.subscribed_contracts = snapshot.feed.subscribed_contracts;
-        state.status.last_event_at = Some(Utc::now().to_rfc3339());
+        state.status.last_event_at = Some(now.to_rfc3339());
         state.status.last_snapshot_at = Some(snapshot.feed.as_of.clone());
         state.status.last_snapshot_sequence = Some(snapshot.sequence);
         state.status.latency_ms = Some(snapshot.feed.latency_ms);
         state.status.stale_after_ms = snapshot.feed.stale_after_ms;
         state.status.error = None;
         state.active = Some(request);
-        state.latest = Some(snapshot);
+        state.latest = Some(cached);
+        snapshot
     }
 }
 
@@ -554,7 +699,7 @@ async fn fetch_snapshot(
     risk_free_rate: f64,
     stale_after_ms: u64,
     sequence: u64,
-) -> anyhow::Result<LiveSnapshot> {
+) -> anyhow::Result<CachedThetaSnapshot> {
     let value = bridge
         .request(json!({
             "op": "snapshot",
@@ -575,6 +720,7 @@ async fn fetch_snapshot(
         risk_free_rate,
         stale_after_ms,
         sequence,
+        (Utc::now(), Instant::now()),
     )
 }
 
@@ -585,17 +731,25 @@ fn build_live_snapshot(
     risk_free_rate: f64,
     stale_after_ms: u64,
     sequence: u64,
-) -> anyhow::Result<LiveSnapshot> {
+    clock: (DateTime<Utc>, Instant),
+) -> anyhow::Result<CachedThetaSnapshot> {
     anyhow::ensure!(
         payload.spot.is_finite() && payload.spot > 0.0,
         "invalid ThetaData spot"
     );
-    let now = Utc::now();
+    let (now, instant) = clock;
     let stock_timestamp = payload.stock_timestamp.as_deref().and_then(parse_timestamp);
     let option_timestamps: Vec<Option<DateTime<Utc>>> = payload
         .contracts
         .iter()
         .map(|contract| contract.timestamp.as_deref().and_then(parse_timestamp))
+        .collect();
+    let selected_option_timestamps = payload
+        .contracts
+        .iter()
+        .zip(&option_timestamps)
+        .filter(|(contract, _)| contract.expiration == payload.selected_expiration)
+        .map(|(_, timestamp)| *timestamp)
         .collect();
     let as_of = option_timestamps
         .iter()
@@ -739,7 +893,7 @@ fn build_live_snapshot(
     } else {
         "ready"
     };
-    Ok(LiveSnapshot {
+    let snapshot = LiveSnapshot {
         kind: "live_snapshot",
         sequence,
         feed: LiveFeedInfo {
@@ -764,6 +918,14 @@ fn build_live_snapshot(
         bars,
         chain,
         surface,
+    };
+    Ok(CachedThetaSnapshot {
+        snapshot,
+        observed_at: now,
+        observed_instant: instant,
+        underlying_at: stock_timestamp,
+        option_timestamps,
+        selected_option_timestamps,
     })
 }
 
@@ -814,15 +976,18 @@ fn round(value: f64, digits: i32) -> f64 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn normalized_snapshot_uses_rust_analytics_and_theta_provenance() {
+    fn fixture(now: DateTime<Utc>) -> (ThetaSnapshotPayload, LiveSessionRequest) {
+        let timestamp = now.to_rfc3339();
+        let expiry = now.date_naive() + chrono::Duration::days(7);
+        let expiration = expiry.to_string();
         let contracts: Vec<Value> = (0..16)
             .flat_map(|index| {
                 let strike = 590.0 + index as f64 * 2.0;
+                let timestamp = timestamp.clone();
                 ["CALL", "PUT"].map(move |right| {
                     json!({
-                        "symbol": format!("SPY260904{}{:08}", if right == "CALL" { "C" } else { "P" }, (strike * 1000.0) as i64),
-                        "expiration": "2026-09-04",
+                        "symbol": format!("SPY{}{}{:08}", expiry.format("%y%m%d"), if right == "CALL" { "C" } else { "P" }, (strike * 1000.0) as i64),
+                        "expiration": expiry.to_string(),
                         "strike": strike,
                         "right": right,
                         "bid": 4.8,
@@ -832,7 +997,7 @@ mod tests {
                         "last": 4.9,
                         "volume": 100,
                         "open_interest": 500,
-                        "timestamp": "2026-08-28T19:00:00Z"
+                        "timestamp": timestamp
                     })
                 })
             })
@@ -841,11 +1006,11 @@ mod tests {
             "sdk_version": "1.0.7",
             "symbol": "SPY",
             "spot": 605.0,
-            "stock_timestamp": "2026-08-28T19:00:00Z",
-            "stock_bar": {"time":"15:00","timestamp":"2026-08-28T19:00:00Z","open":604.0,"high":606.0,"low":603.5,"close":605.0,"volume":1000,"vwap":604.8},
+            "stock_timestamp": timestamp,
+            "stock_bar": {"time":"15:00","timestamp":timestamp,"open":604.0,"high":606.0,"low":603.5,"close":605.0,"volume":1000,"vwap":604.8},
             "bars": [],
-            "selected_expiration": "2026-09-04",
-            "expirations": ["2026-09-04"],
+            "selected_expiration": expiration,
+            "expirations": [expiration],
             "contracts": contracts,
             "contract_limit": 420
         }))
@@ -853,19 +1018,342 @@ mod tests {
         let request = LiveSessionRequest {
             provider: "thetadata".into(),
             symbol: "SPY".into(),
-            expiration: Some("2026-09-04".into()),
+            expiration: Some(expiration),
             max_contracts: 420,
             surface_expiries: 2,
             moneyness_window: 0.12,
             pricing_mode: "mid".into(),
             dealer_model: "classic".into(),
         };
-        let snapshot =
-            build_live_snapshot(payload, &request, Vec::new(), 0.043, 15_000, 7).unwrap();
+        (payload, request)
+    }
+
+    fn clock() -> (DateTime<Utc>, Instant) {
+        (
+            parse_timestamp("2026-08-28T19:00:00Z").unwrap(),
+            Instant::now(),
+        )
+    }
+
+    fn strategy(snapshot: &LiveSnapshot) -> crate::strategy::StrategyAnalysis {
+        crate::strategy::analyze_strategy(
+            &snapshot.chain,
+            &[crate::strategy::StrategyLegInput {
+                symbol: None,
+                strike: 604.0,
+                right: "CALL".into(),
+                side: "BUY".into(),
+                ratio: 1,
+            }],
+            1,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn normalized_snapshot_uses_rust_analytics_and_theta_provenance() {
+        let clock = clock();
+        let (payload, request) = fixture(clock.0);
+        let snapshot = build_live_snapshot(payload, &request, Vec::new(), 0.043, 15_000, 7, clock)
+            .unwrap()
+            .snapshot;
         assert_eq!(snapshot.feed.source, "ThetaData");
         assert_eq!(snapshot.feed.sdk_version, "1.0.7");
         assert_eq!(snapshot.chain.provenance.model, "Rust-BSM+SVI-v2");
         assert!(!snapshot.chain.rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cached_snapshot_ages_without_push_and_new_quotes_restore_readiness() {
+        let (now, instant) = clock();
+        let (payload, request) = fixture(now);
+        let cached = build_live_snapshot(
+            payload,
+            &request,
+            Vec::new(),
+            0.043,
+            15_000,
+            7,
+            (now, instant),
+        )
+        .unwrap();
+        let manager = ThetaLiveManager::new(0.043);
+        let mut events = manager.subscribe();
+        let original = manager
+            .store_snapshot_at(request.clone(), cached, now, instant)
+            .await;
+        assert!(strategy(&original).executable);
+        // A blocked provider request holds this mutex. Snapshot/heartbeat reads
+        // still have to make progress and age the existing quote facts.
+        let bridge = manager.bridge.lock().await;
+        let boundary = manager
+            .snapshot_at(
+                now + chrono::Duration::milliseconds(15_000),
+                instant + Duration::from_millis(15_000),
+            )
+            .await
+            .unwrap();
+        assert_eq!(boundary.feed.fresh_quote_coverage_pct, 100.0);
+        let stale = tokio::time::timeout(
+            Duration::from_millis(100),
+            manager.snapshot_at(
+                now + chrono::Duration::milliseconds(15_001),
+                instant + Duration::from_millis(15_001),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(bridge);
+        assert_eq!(stale.feed.quality_state, "stale_underlying");
+        assert_eq!(stale.feed.latency_ms, 15_001);
+        assert_eq!(stale.feed.fresh_quote_coverage_pct, 0.0);
+        assert_eq!(stale.chain.quality.fresh_quote_coverage_pct, 0.0);
+        assert_eq!(stale.chain.quality.spot_age_ms, Some(15_001));
+        let analysis = strategy(&stale);
+        assert!(!analysis.executable);
+        assert!(
+            analysis
+                .blockers
+                .iter()
+                .any(|reason| reason.starts_with("fresh quote coverage"))
+        );
+        assert!(
+            analysis
+                .blockers
+                .iter()
+                .any(|reason| reason.starts_with("underlying quote age"))
+        );
+        assert_eq!(stale.sequence, original.sequence);
+        assert_eq!(stale.feed.as_of, original.feed.as_of);
+        assert_eq!(stale.chain.timestamp, original.chain.timestamp);
+        assert_eq!(stale.chain.snapshot_id, original.chain.snapshot_id);
+        assert_eq!(
+            serde_json::to_value(&stale.chain.rows).unwrap(),
+            serde_json::to_value(&original.chain.rows).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&stale.surface).unwrap(),
+            serde_json::to_value(&original.surface).unwrap()
+        );
+        assert_eq!(manager.sequence.load(Ordering::Relaxed), 0);
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        let status = manager.state.read().await.status.clone();
+        assert_eq!(status.state, "degraded");
+        assert_eq!(status.latency_ms, Some(15_001));
+        assert_eq!(
+            status.last_snapshot_at.as_deref(),
+            Some(original.feed.as_of.as_str())
+        );
+        assert_eq!(status.last_snapshot_sequence, Some(7));
+
+        let renewed_at = now + chrono::Duration::seconds(16);
+        let renewed_instant = instant + Duration::from_secs(16);
+        let (payload, _) = fixture(renewed_at);
+        let cached = build_live_snapshot(
+            payload,
+            &request,
+            Vec::new(),
+            0.043,
+            15_000,
+            8,
+            (renewed_at, renewed_instant),
+        )
+        .unwrap();
+        let renewed = manager
+            .store_snapshot_at(request, cached, renewed_at, renewed_instant)
+            .await;
+        assert_eq!(renewed.sequence, 8);
+        assert_eq!(renewed.feed.quality_state, "ready");
+        assert_eq!(renewed.feed.fresh_quote_coverage_pct, 100.0);
+        assert_eq!(renewed.chain.quality.spot_age_ms, Some(0));
+        assert!(strategy(&renewed).executable);
+    }
+
+    #[test]
+    fn freshness_counts_selected_expiry_separately_and_missing_timestamps_stay_unknown() {
+        let (now, instant) = clock();
+        let (mut payload, request) = fixture(now);
+        payload.contracts[0].timestamp = None;
+        let selected = payload.contracts.clone();
+        payload.expirations.push("2026-09-11".into());
+        payload
+            .contracts
+            .extend(selected.into_iter().map(|mut contract| {
+                contract.expiration = "2026-09-11".into();
+                contract.timestamp = Some((now + chrono::Duration::seconds(16)).to_rfc3339());
+                contract
+            }));
+        payload.stock_timestamp = Some((now + chrono::Duration::seconds(16)).to_rfc3339());
+        let mut cached = build_live_snapshot(
+            payload,
+            &request,
+            Vec::new(),
+            0.043,
+            15_000,
+            7,
+            (now, instant),
+        )
+        .unwrap();
+        let initial = cached.at(now, instant);
+        assert_eq!(initial.chain.quality.fresh_quote_coverage_pct, 96.88);
+        assert_eq!(initial.feed.fresh_quote_coverage_pct, 98.44);
+        let stale = cached.at(
+            now + chrono::Duration::seconds(16),
+            instant + Duration::from_secs(16),
+        );
+        assert_eq!(stale.chain.quality.fresh_quote_coverage_pct, 0.0);
+        assert_eq!(stale.feed.fresh_quote_coverage_pct, 50.0);
+        assert_eq!(stale.feed.quality_state, "stale_options");
+
+        let (mut payload, request) = fixture(now);
+        payload.stock_timestamp = None;
+        let mut cached = build_live_snapshot(
+            payload,
+            &request,
+            Vec::new(),
+            0.043,
+            15_000,
+            7,
+            (now, instant),
+        )
+        .unwrap();
+        let missing = cached.at(now, instant);
+        assert_eq!(missing.chain.quality.spot_age_ms, None);
+        assert_eq!(missing.feed.quality_state, "missing_timestamp");
+        assert!(!strategy(&missing).executable);
+    }
+
+    #[tokio::test]
+    async fn wall_clock_rollback_cannot_freshen_cached_or_repolled_old_quotes() {
+        let (now, instant) = clock();
+        let (payload, request) = fixture(now);
+        let manager = ThetaLiveManager::new(0.043);
+        let cached = build_live_snapshot(
+            payload.clone(),
+            &request,
+            Vec::new(),
+            0.043,
+            15_000,
+            7,
+            (now, instant),
+        )
+        .unwrap();
+        manager
+            .store_snapshot_at(request.clone(), cached, now, instant)
+            .await;
+        manager
+            .snapshot_at(now + chrono::Duration::seconds(30), instant)
+            .await
+            .unwrap();
+        let rollback = manager
+            .snapshot_at(now, instant + Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(rollback.chain.quality.spot_age_ms, Some(31_000));
+        let repoll_instant = instant + Duration::from_secs(2);
+        let cached = build_live_snapshot(
+            payload,
+            &request,
+            Vec::new(),
+            0.043,
+            15_000,
+            8,
+            (now, repoll_instant),
+        )
+        .unwrap();
+        let repolled = manager
+            .store_snapshot_at(request, cached, now, repoll_instant)
+            .await;
+        assert_eq!(repolled.sequence, 8);
+        assert_eq!(repolled.chain.quality.spot_age_ms, Some(32_000));
+        assert_eq!(repolled.feed.quality_state, "stale_underlying");
+        assert_eq!(repolled.chain.quality.fresh_quote_coverage_pct, 0.0);
+    }
+
+    #[tokio::test]
+    async fn poll_error_notifies_without_a_quote_update_and_success_clears_error() {
+        let (now, instant) = clock();
+        let (payload, request) = fixture(now);
+        let manager = ThetaLiveManager::new(0.043);
+        let cached = build_live_snapshot(
+            payload.clone(),
+            &request,
+            Vec::new(),
+            0.043,
+            15_000,
+            7,
+            (now, instant),
+        )
+        .unwrap();
+        manager
+            .store_snapshot_at(request.clone(), cached, now, instant)
+            .await;
+        let mut events = manager.subscribe();
+        manager
+            .record_error(&anyhow!("synthetic provider timeout"), false)
+            .await;
+        assert_eq!(events.try_recv().unwrap(), 7);
+        assert_eq!(manager.sequence.load(Ordering::Relaxed), 0);
+        let failed = manager.snapshot_at(now, instant).await.unwrap();
+        assert_eq!(failed.sequence, 7);
+        assert_eq!(failed.feed.quality_state, "provider_error");
+        assert_eq!(manager.state.read().await.status.state, "degraded");
+        let stale = manager
+            .snapshot_at(
+                now + chrono::Duration::seconds(16),
+                instant + Duration::from_secs(16),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale.feed.quality_state, "stale_underlying");
+        assert!(!strategy(&stale).executable);
+        let renewed_at = now + chrono::Duration::seconds(17);
+        let renewed_instant = instant + Duration::from_secs(17);
+        let (payload, _) = fixture(renewed_at);
+        let cached = build_live_snapshot(
+            payload,
+            &request,
+            Vec::new(),
+            0.043,
+            15_000,
+            8,
+            (renewed_at, renewed_instant),
+        )
+        .unwrap();
+        let renewed = manager
+            .store_snapshot_at(request, cached, renewed_at, renewed_instant)
+            .await;
+        assert_eq!(renewed.feed.quality_state, "ready");
+        assert_eq!(manager.state.read().await.status.error, None);
+    }
+
+    #[tokio::test]
+    async fn status_read_ages_quotes_without_snapshot_clients() {
+        let now = Utc::now() - chrono::Duration::seconds(16);
+        let instant = Instant::now() - Duration::from_secs(16);
+        let (payload, request) = fixture(now);
+        let cached = build_live_snapshot(
+            payload,
+            &request,
+            Vec::new(),
+            0.043,
+            15_000,
+            7,
+            (now, instant),
+        )
+        .unwrap();
+        let manager = ThetaLiveManager::new(0.043);
+        manager
+            .store_snapshot_at(request, cached, now, instant)
+            .await;
+        let status = manager.status().await;
+        assert_eq!(status.state, "degraded");
+        assert!(status.latency_ms.unwrap() >= 16_000);
+        assert_eq!(status.last_snapshot_sequence, Some(7));
     }
 
     #[test]

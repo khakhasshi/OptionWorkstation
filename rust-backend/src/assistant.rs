@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, anyhow};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -304,6 +304,23 @@ impl AssistantManager {
         session.imported_from = Some(audit_record_id);
         session.messages.truncate(MAX_MESSAGES);
         session.contexts.truncate(MAX_CONTEXTS);
+        let mut context_ids = HashMap::new();
+        for context in &mut session.contexts {
+            let previous_id = context.id.clone();
+            if let Some(bars) = context.payload.get("market_bars").cloned() {
+                context.payload["market_bars"] =
+                    json!(compact_market_bars(Some(bars), &context.as_of));
+            }
+            context.id = context_id(&context.snapshot_id, &context.as_of, &context.payload);
+            context_ids.insert(previous_id, context.id.clone());
+        }
+        for message in &mut session.messages {
+            for id in &mut message.context_ids {
+                if let Some(updated_id) = context_ids.get(id) {
+                    *id = updated_id.clone();
+                }
+            }
+        }
         self.sessions.write().await.insert(id, session.clone());
         session
     }
@@ -523,7 +540,7 @@ impl AssistantManager {
         }
 
         let mut stream = response.bytes_stream();
-        let mut buffer = String::new();
+        let mut buffer = Vec::new();
         let mut answer = String::new();
         let mut finished = false;
         while !finished {
@@ -531,10 +548,9 @@ impl AssistantManager {
                 break;
             };
             let chunk = chunk.context("read LLM stream")?;
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
-            while let Some(index) = buffer.find('\n') {
-                let line = buffer[..index].trim().to_string();
-                buffer.drain(..=index);
+            buffer.extend_from_slice(&chunk);
+            while let Some(line) = take_stream_line(&mut buffer)? {
+                let line = line.trim();
                 let Some(data) = line.strip_prefix("data:") else {
                     continue;
                 };
@@ -572,19 +588,27 @@ impl AssistantManager {
     }
 }
 
+fn take_stream_line(buffer: &mut Vec<u8>) -> anyhow::Result<Option<String>> {
+    let Some(index) = buffer.iter().position(|byte| *byte == b'\n') else {
+        return Ok(None);
+    };
+    // Network chunks may split a UTF-8 character. Decode only complete SSE
+    // lines, retaining all incomplete bytes for the next chunk.
+    String::from_utf8(buffer.drain(..=index).collect())
+        .map(Some)
+        .context("decode UTF-8 LLM stream line")
+}
+
 pub fn build_context(input: AssistantContextInput) -> AssistantContext {
-    let compact = compact_payload(&input.payload, input.market_bars, input.strategy);
-    let quality_state = quality_state(&compact);
-    let digest = Sha256::digest(
-        serde_json::to_vec(&json!({
-            "snapshot_id": &input.snapshot_id,
-            "as_of": &input.as_of,
-            "payload": &compact,
-        }))
-        .unwrap_or_default(),
+    let compact = compact_payload(
+        &input.payload,
+        input.market_bars,
+        input.strategy,
+        &input.as_of,
     );
+    let quality_state = quality_state(&compact);
     AssistantContext {
-        id: format!("context:{}", &hex::encode(digest)[..20]),
+        id: context_id(&input.snapshot_id, &input.as_of, &compact),
         label: input.label,
         mode: input.mode,
         symbol: input.symbol,
@@ -596,7 +620,24 @@ pub fn build_context(input: AssistantContextInput) -> AssistantContext {
     }
 }
 
-fn compact_payload(payload: &Value, market_bars: Option<Value>, strategy: Option<Value>) -> Value {
+fn context_id(snapshot_id: &str, as_of: &str, payload: &Value) -> String {
+    let digest = Sha256::digest(
+        serde_json::to_vec(&json!({
+            "snapshot_id": snapshot_id,
+            "as_of": as_of,
+            "payload": payload,
+        }))
+        .unwrap_or_default(),
+    );
+    format!("context:{}", &hex::encode(digest)[..20])
+}
+
+fn compact_payload(
+    payload: &Value,
+    market_bars: Option<Value>,
+    strategy: Option<Value>,
+    as_of: &str,
+) -> Value {
     let root = payload.get("snapshot").unwrap_or(payload);
     let chain = root.get("chain").or_else(|| payload.get("chain"));
     let surface = root.get("surface").or_else(|| payload.get("surface"));
@@ -647,17 +688,7 @@ fn compact_payload(payload: &Value, market_bars: Option<Value>, strategy: Option
         })
     });
 
-    let bars = market_bars
-        .and_then(|value| value.as_array().cloned())
-        .unwrap_or_default();
-    let market_bars = bars
-        .into_iter()
-        .rev()
-        .take(90)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>();
+    let market_bars = compact_market_bars(market_bars, as_of);
 
     json!({
         "chain": compact_chain,
@@ -674,6 +705,30 @@ fn compact_payload(payload: &Value, market_bars: Option<Value>, strategy: Option
             "raw_chain_available_in_source_snapshot": true,
         },
     })
+}
+
+fn compact_market_bars(market_bars: Option<Value>, as_of: &str) -> Vec<Value> {
+    let Ok(cutoff) = DateTime::parse_from_rfc3339(as_of) else {
+        return Vec::new();
+    };
+    let mut bars = market_bars
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|bar| {
+            let timestamp = bar
+                .get("timestamp")?
+                .as_str()
+                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())?;
+            (timestamp <= cutoff).then_some((timestamp, bar))
+        })
+        .collect::<Vec<_>>();
+    // Replay sessions include the whole day. Apply the frozen time boundary
+    // before selecting the history window, including for imported audit data.
+    bars.sort_by_key(|entry| entry.0);
+    let excess = bars.len().saturating_sub(90);
+    bars.drain(..excess);
+    bars.into_iter().map(|(_, bar)| bar).collect()
 }
 
 fn compact_svi(value: Option<&Value>) -> Value {
@@ -1001,6 +1056,122 @@ mod tests {
                 <= 96
         );
         assert_eq!(context.payload["chain"]["chain_row_count"], 150);
+    }
+
+    #[test]
+    fn context_market_history_excludes_future_and_invalid_timestamps() {
+        let bars = json!([
+            {"timestamp": "2026-07-10T20:00:00Z", "close": 999.0},
+            {"timestamp": "2026-07-10T09:35:00-04:00", "close": 102.0},
+            {"timestamp": "2026-07-10T13:30:00Z", "close": 100.0},
+            {"timestamp": "2026-07-10T13:35:00.001Z", "close": 998.0},
+            {"timestamp": "2026-07-10T09:34:00-04:00", "close": 101.0},
+            {"timestamp": "invalid", "close": 997.0},
+            {"timestamp": "2026-07-10T09:31:00", "close": 996.0},
+            {"close": 995.0}
+        ]);
+        for mode in ["replay", "live", "audit"] {
+            let context = build_context(AssistantContextInput {
+                label: "SPY 09:35".into(),
+                mode: mode.into(),
+                symbol: "SPY".into(),
+                snapshot_id: "history-boundary-test".into(),
+                as_of: "2026-07-10T13:35:00Z".into(),
+                model_version: None,
+                payload: json!({}),
+                market_bars: Some(bars.clone()),
+                strategy: None,
+            });
+            let history = context.payload["market_bars"].as_array().unwrap();
+            assert_eq!(history.len(), 3);
+            assert_eq!(history[0]["close"], 100.0);
+            assert_eq!(history[1]["close"], 101.0);
+            assert_eq!(history[2]["close"], 102.0);
+        }
+    }
+
+    #[test]
+    fn market_history_keeps_latest_ninety_causal_bars_and_fails_closed() {
+        let start = DateTime::parse_from_rfc3339("2026-07-10T13:00:00Z").unwrap();
+        let bars = (0..150)
+            .rev()
+            .map(|minute| {
+                json!({
+                    "timestamp": (start + chrono::Duration::minutes(minute)).to_rfc3339(),
+                    "close": minute,
+                })
+            })
+            .collect::<Vec<_>>();
+        let history = compact_market_bars(
+            Some(json!(bars)),
+            &(start + chrono::Duration::minutes(119)).to_rfc3339(),
+        );
+        assert_eq!(history.len(), 90);
+        assert_eq!(history.first().unwrap()["close"], 30);
+        assert_eq!(history.last().unwrap()["close"], 119);
+        assert!(compact_market_bars(Some(json!(bars)), "invalid").is_empty());
+        assert!(compact_market_bars(None, &start.to_rfc3339()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn imported_context_history_obeys_cutoff_and_keeps_message_references() {
+        let manager = mock_manager();
+        let mut session = manager
+            .create_session(AssistantCreateRequest { title: None })
+            .await;
+        let mut context = sample_context();
+        context.payload["market_bars"] = json!([
+            {"timestamp": "2026-07-10T13:59:00Z", "close": 100.0},
+            {"timestamp": "2026-07-10T14:01:00Z", "close": 999.0}
+        ]);
+        context.id = "legacy-context".into();
+        session.messages.push(AssistantMessage {
+            id: "message-import".into(),
+            role: "user".into(),
+            content: "分析这个截面".into(),
+            created_at: session.created_at.clone(),
+            context_ids: vec![context.id.clone()],
+        });
+        session.contexts.push(context);
+        let imported = manager.import_session(session, "audit-record".into()).await;
+        let context = &imported.contexts[0];
+        assert_eq!(context.payload["market_bars"].as_array().unwrap().len(), 1);
+        assert_eq!(context.payload["market_bars"][0]["close"], 100.0);
+        assert_eq!(
+            context.id,
+            context_id(&context.snapshot_id, &context.as_of, &context.payload)
+        );
+        assert_eq!(
+            imported.messages[0].context_ids.as_slice(),
+            std::slice::from_ref(&context.id)
+        );
+    }
+
+    #[test]
+    fn sse_lines_preserve_unicode_across_every_network_split() {
+        let frame = "data: {\"choices\":[{\"delta\":{\"content\":\"期权🙂Δ\"}}]}\r\n";
+        let bytes = frame.as_bytes();
+        for split in 0..bytes.len() {
+            let mut buffer = bytes[..split].to_vec();
+            assert!(take_stream_line(&mut buffer).unwrap().is_none());
+            buffer.extend_from_slice(&bytes[split..]);
+            let line = take_stream_line(&mut buffer).unwrap().unwrap();
+            assert_eq!(line, frame);
+            let payload: Value =
+                serde_json::from_str(line.trim().strip_prefix("data:").unwrap().trim()).unwrap();
+            assert_eq!(payload["choices"][0]["delta"]["content"], "期权🙂Δ");
+            assert!(buffer.is_empty());
+        }
+        let mut buffer = Vec::new();
+        let mut lines = Vec::new();
+        for byte in format!("{frame}\ndata: [DONE]\n").bytes() {
+            buffer.push(byte);
+            while let Some(line) = take_stream_line(&mut buffer).unwrap() {
+                lines.push(line);
+            }
+        }
+        assert_eq!(lines, [frame, "\n", "data: [DONE]\n"]);
+        assert!(buffer.is_empty());
     }
 
     #[test]

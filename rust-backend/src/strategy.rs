@@ -330,6 +330,17 @@ pub fn analyze_strategy(
             chain.quality.spot_age_ms.unwrap_or_default()
         ));
     }
+    if chain.quality.spot_age_ms.is_none()
+        && matches!(
+            (
+                chain.provenance.source.as_str(),
+                chain.provenance.quote_interval.as_str()
+            ),
+            ("Longbridge", "tick") | ("ThetaData", "realtime_snapshot_poll")
+        )
+    {
+        blockers.push("underlying quote timestamp is unavailable for live data".into());
+    }
     for leg in &resolved {
         if leg.row.bid <= 0.0 || leg.row.ask <= 0.0 || leg.row.ask < leg.row.bid {
             blockers.push(format!("invalid NBBO for {}", leg.row.symbol));
@@ -502,8 +513,7 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn executable_prices_include_the_spread() {
+    fn test_chain() -> ChainSnapshot {
         let row = |symbol: &str, right: &str, strike: f64, bid: f64, ask: f64| ChainRow {
             symbol: symbol.into(),
             strike,
@@ -533,7 +543,7 @@ mod tests {
             quality_score: 90.0,
             quality_flags: vec![],
         };
-        let chain = ChainSnapshot {
+        ChainSnapshot {
             snapshot_id: "snapshot".into(),
             symbol: "SPY".into(),
             date: "2026-07-22".into(),
@@ -596,7 +606,12 @@ mod tests {
                 row("C95", "CALL", 95.0, 6.0, 6.2),
                 row("C105", "CALL", 105.0, 1.0, 1.2),
             ],
-        };
+        }
+    }
+
+    #[test]
+    fn executable_prices_include_the_spread() {
+        let chain = test_chain();
         let analysis = analyze_strategy(
             &chain,
             &[
@@ -622,5 +637,40 @@ mod tests {
         assert_eq!(analysis.immediate_pnl, -40.0);
         assert!(analysis.max_loss.is_some());
         assert!(analysis.executable);
+    }
+
+    #[test]
+    fn missing_underlying_timestamp_blocks_live_but_not_historical_quotes() {
+        let mut chain = test_chain();
+        chain.quality.spot_age_ms = None;
+        let legs = [StrategyLegInput {
+            symbol: Some("C95".into()),
+            strike: 95.0,
+            right: "CALL".into(),
+            side: "BUY".into(),
+            ratio: 1,
+        }];
+        for source in ["Longbridge", "ThetaData"] {
+            chain.provenance.source = source.into();
+            chain.provenance.quote_interval = if source == "ThetaData" {
+                "realtime_snapshot_poll"
+            } else {
+                "tick"
+            }
+            .into();
+            let analysis = analyze_strategy(&chain, &legs, 1).unwrap();
+            assert!(!analysis.executable, "{source}");
+            assert!(
+                analysis
+                    .blockers
+                    .iter()
+                    .any(|reason| reason.contains("timestamp is unavailable"))
+            );
+        }
+        chain.provenance.quote_interval = "1m".into();
+        assert!(analyze_strategy(&chain, &legs, 1).unwrap().executable);
+        chain.provenance.quote_interval = "realtime_snapshot_poll".into();
+        chain.quality.spot_age_ms = Some(0);
+        assert!(analyze_strategy(&chain, &legs, 1).unwrap().executable);
     }
 }
