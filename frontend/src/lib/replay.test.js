@@ -7,6 +7,7 @@ function fakeClock() {
   let nextId = 0
   const timers = new Map()
   return {
+    now: () => now,
     setTimeout(callback, delay) {
       const id = ++nextId
       timers.set(id, { callback, at: now + delay })
@@ -44,7 +45,7 @@ function harness() {
   const controller = createReplayController({
     clock,
     load: (next, signal) => new Promise((resolve, reject) => {
-      pending.push({ request: next, signal, resolve, reject })
+      pending.push({ request: next, signal, resolve, reject, startedAt: clock.now() })
     }),
     onCommit: (next, data) => commits.push({ ...next, data }),
     onFrame: (frame) => {
@@ -205,4 +206,128 @@ test('a missing session and unmount abort requests and ignore late failures or r
   h.clock.advance(1000)
   assert.deepEqual(h.commits, [])
   assert.deepEqual(h.requestedFrames, [])
+})
+
+test('a fast load consumes part of the 30x period instead of adding a full wait', async () => {
+  const h = harness()
+  const period = 1000 / 30
+  h.update({}, { playing: true })
+  await flush()
+  h.clock.advance(10)
+  await h.resolve(0)
+  h.clock.advance(period - 10 - 1)
+  await flush()
+  assert.equal(h.pending.length, 1)
+  h.clock.advance(1)
+  await flush()
+  assert.equal(h.pending.length, 2)
+  assert.equal(h.pending[1].startedAt, period)
+  assert.equal(h.pending[0].signal.aborted, false)
+  h.controller.dispose()
+})
+
+test('a slow load advances immediately after completion without catch-up requests', async () => {
+  const h = harness()
+  h.update({}, { playing: true })
+  await flush()
+  h.clock.advance(300)
+  await h.resolve(0)
+  h.clock.advance(0)
+  await flush()
+  assert.equal(h.pending.length, 2)
+  assert.equal(h.pending[1].startedAt, 300)
+  assert.deepEqual(h.requestedFrames, [1])
+  h.clock.advance(10_000)
+  await flush()
+  assert.equal(h.pending.length, 2)
+  assert.equal(h.pending[1].signal.aborted, false)
+  await h.resolve(1)
+  h.clock.advance(0)
+  await flush()
+  assert.equal(h.pending.length, 3)
+  assert.deepEqual(h.requestedFrames, [1, 2])
+  h.controller.dispose()
+})
+
+test('resuming a completed snapshot uses the resume time, excluding paused time', async () => {
+  const h = harness()
+  const period = 1000 / 30
+  h.update({}, { playing: true })
+  await flush()
+  h.clock.advance(10)
+  await h.resolve(0)
+  h.update({}, { playing: false })
+  h.clock.advance(5000)
+  h.update({}, { playing: true })
+  h.clock.advance(period - 1)
+  await flush()
+  assert.equal(h.pending.length, 1)
+  h.clock.advance(1)
+  await flush()
+  assert.equal(h.pending[1].startedAt, 5010 + period)
+  assert.deepEqual(h.requestedFrames, [1])
+  h.controller.dispose()
+})
+
+test('resuming an in-flight snapshot also starts a new playback period', async () => {
+  const h = harness()
+  const period = 1000 / 30
+  h.update({}, { playing: true })
+  await flush()
+  h.clock.advance(10)
+  h.update({}, { playing: false })
+  h.clock.advance(1000)
+  h.update({}, { playing: true })
+  h.clock.advance(5)
+  await h.resolve(0)
+  h.clock.advance(period - 5 - 1)
+  await flush()
+  assert.equal(h.pending.length, 1)
+  h.clock.advance(1)
+  await flush()
+  assert.equal(h.pending[1].startedAt, 1010 + period)
+  assert.equal(h.pending[0].signal.aborted, false)
+  h.controller.dispose()
+})
+
+test('speed changes adjust the remaining period without restarting loads or skipping frames', async () => {
+  const h = harness()
+  h.update({}, { playing: true, speed: 5 })
+  await flush()
+  h.clock.advance(100)
+  h.update({}, { speed: 30 })
+  await h.resolve(0)
+  h.clock.advance(0)
+  await flush()
+  assert.equal(h.pending[1].startedAt, 100)
+  h.clock.advance(10)
+  h.update({}, { speed: 5 })
+  h.clock.advance(10)
+  await h.resolve(1)
+  h.clock.advance(179)
+  await flush()
+  assert.equal(h.pending.length, 2)
+  h.clock.advance(1)
+  await flush()
+  assert.equal(h.pending[2].startedAt, 300)
+  assert.deepEqual(h.requestedFrames, [1, 2])
+  assert.ok(h.pending.every((request) => !request.signal.aborted))
+  h.controller.dispose()
+})
+
+test('changing speed on a ready frame reschedules only the remaining period', async () => {
+  const h = harness()
+  h.update({}, { playing: true, speed: 30 })
+  await flush()
+  h.clock.advance(10)
+  await h.resolve(0)
+  h.update({}, { speed: 1 })
+  h.clock.advance(989)
+  await flush()
+  assert.equal(h.pending.length, 1)
+  h.clock.advance(1)
+  await flush()
+  assert.equal(h.pending[1].startedAt, 1000)
+  assert.deepEqual(h.requestedFrames, [1])
+  h.controller.dispose()
 })

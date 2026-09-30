@@ -183,3 +183,36 @@ Benchmark before and after. Keep separate measurements for:
 
 Do not trade away freshness or quality checks for headline latency without
 showing the behavioral effect.
+
+For end-to-end replay comparisons, preserve the baseline release binary before
+editing, then run the same licensed dataset against both builds:
+
+```bash
+mkdir -p artifacts/performance
+cargo build --locked --release --manifest-path rust-backend/Cargo.toml
+cp rust-backend/target/release/option-workstation artifacts/performance/baseline-server
+python3 scripts/benchmark-replay.py \
+  --binary artifacts/performance/baseline-server \
+  --data-root "$OPTION_WORKSTATION_DATA_ROOT" \
+  --date 2026-07-10 --expiration 2026-07-17 \
+  --output artifacts/performance/before
+
+# After editing and rebuilding the release binary:
+python3 scripts/benchmark-replay.py \
+  --binary rust-backend/target/release/option-workstation \
+  --data-root "$OPTION_WORKSTATION_DATA_ROOT" \
+  --date 2026-07-10 --expiration 2026-07-17 \
+  --output artifacts/performance/after --compare artifacts/performance/before
+```
+
+Choose dates and expirations available in your dataset. Use `--symbol`,
+`--minutes`, `--pricing-mode`, `--dealer-model`, and `--max-dte` for other
+scenarios. Each invocation starts and stops an isolated loopback server with
+fresh application caches and no provider credentials. It measures five new
+minutes, five repeated frames, then individual chain/surface/volatility routes.
+OS file caches are not flushed, and HTTP timings include serialization and
+transfer; these are not individual kernel timings or browser frame rates.
+Run comparisons sequentially without competing builds. Complete responses and
+reports stay in ignored `artifacts/`; never commit licensed rows. A comparison
+fails if any parsed JSON response differs, including analytics and quality
+metadata.

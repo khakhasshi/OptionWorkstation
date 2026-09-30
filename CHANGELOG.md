@@ -36,6 +36,18 @@ and releases use semantic versioning after the public API stabilizes.
   then update the full workspace only after the provider confirms the new
   expiration.
 
+### Performance
+
+- Replay filters Parquet timestamps before decoding the selected minute's
+  quote columns, including the requested New York trading date.
+- Matched-DTE IV history uses the same ATM pricing rules without building
+  unused Greeks, SVI fits, or dealer scenarios. SVI fitting reuses invariant
+  sample weights and density grids.
+- Playback counts request time towards each frame period while retaining
+  complete snapshots, cancellation, and one active request.
+- Added an isolated release-binary benchmark with complete JSON response
+  comparison, separate sequential/repeated-frame timings, and local reports.
+
 ### Security
 
 - Server-side rejection of paper orders priced from the market-data-only
