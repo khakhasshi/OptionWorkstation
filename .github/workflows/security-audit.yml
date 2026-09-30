@@ -29,7 +29,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - name: Verify reviewed advisory remains unreachable
+        run: |
+          active_tree="$(cargo tree --manifest-path rust-backend/Cargo.toml --locked --target all -i rkyv 2>/dev/null)"
+          if [[ -n "$active_tree" ]]; then
+            printf 'rkyv entered the active dependency tree:\n%s\n' "$active_tree" >&2
+            exit 1
+          fi
       - uses: rustsec/audit-check@v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           working-directory: rust-backend
+          # rust_decimal lists rkyv as optional metadata, but no target enables it.
+          # The preceding reachability guard fails before this exception can hide
+          # a future activation. See SECURITY.md.
+          ignore: RUSTSEC-2026-0235

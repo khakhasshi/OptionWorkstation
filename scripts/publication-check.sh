@@ -10,6 +10,7 @@ token_prefix="hk_""m_"
 private_key_marker="PRIVATE"" KEY"
 publication_pattern="(${users_prefix}[^/[:space:]]+|${token_prefix}[A-Za-z0-9._-]{20,}|-----BEGIN [A-Z ]*${private_key_marker}-----)"
 if rg --hidden \
+  --glob '!.git' \
   --glob '!.git/**' \
   --glob '!frontend/node_modules/**' \
   --glob '!frontend/dist/**' \
@@ -76,7 +77,7 @@ else
 fi
 
 if cargo audit --version >/dev/null 2>&1; then
-  cargo audit --file rust-backend/Cargo.lock
+  ./scripts/rustsec-check.sh
 else
   printf 'cargo-audit is not installed; CI will run the RustSec audit.\n' >&2
 fi
