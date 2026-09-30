@@ -72,6 +72,8 @@ and releases use semantic versioning after the public API stabilizes.
 
 ### Security
 
+- Updated `rustls` to 0.23.45 for RUSTSEC-2026-0285 and replaced the
+  yanked `chacha20` 0.10.1 lockfile entry with 0.10.2.
 - Updated frontend browser tooling dependencies to remove the current npm
   audit findings while retaining the upstream React security updates.
 - Server-side rejection of paper orders priced from the market-data-only
