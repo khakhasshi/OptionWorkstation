@@ -17,7 +17,8 @@
 
 [English](README.en.md) · [新手指南](frontend/public/guide.html) ·
 [系统架构](docs/ARCHITECTURE.md) · [数据规范](docs/DATA_SOURCES.md) ·
-[示例数据](docs/EXAMPLE_DATA.md) · [API 合约](docs/API.md) · [安全策略](SECURITY.md)
+[示例数据](docs/EXAMPLE_DATA.md) · [API 合约](docs/API.md) · [安全策略](SECURITY.md) ·
+[开发路线图](docs/TRADING_WORKFLOW_ROADMAP.zh-CN.md)
 
 维护者：[JIANGJINGZHE（江景哲）](mailto:jiangjingzhe2004@gmail.com) ·
 [WhatsApp](https://wa.me/85268515553)
@@ -153,7 +154,7 @@ Dealer Exposure 描述的是在给定持仓假设下潜在的对冲机制，不�
 
 ### 9. 面向交易工作的界面
 
-- `总览`、`波动率`、`交易` 三种布局用于不同阶段的关注重点。
+- `总览`、`波动率`、`交易`、`记录` 四个工作区用于不同阶段的关注重点。
 - 面板可以折叠，允许在一个屏幕内同时观察更多同步图表。
 - 底部状态栏持续显示行情状态、数据时间、订阅合约数、Fresh Quote、
   OI 覆盖、传输延迟和质量状态。

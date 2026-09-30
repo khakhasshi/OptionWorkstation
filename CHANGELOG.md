@@ -9,6 +9,9 @@ and releases use semantic versioning after the public API stabilizes.
 
 ### Added
 
+- Planned trading-workflow and option-factor visualization roadmap with
+  priorities, acceptance criteria, DSL compatibility requirements, and staged
+  delivery dependencies; this does not enable the planned features.
 - Focused overview, volatility, trading, and records workspaces with readable
   labels, grouped toolbar controls, expandable model metadata, and responsive
   layouts that retain navigation and playback controls on narrow screens.
