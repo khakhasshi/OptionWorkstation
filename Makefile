@@ -26,6 +26,7 @@ build: setup
 
 test:
 	cargo test --locked --manifest-path rust-backend/Cargo.toml
+	cd frontend && npm test
 	python3 -m pytest -q
 
 check:

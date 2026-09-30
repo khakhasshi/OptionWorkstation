@@ -975,6 +975,11 @@ async fn stream_socket(socket: WebSocket, live: Arc<LiveManager>) {
         return;
     }
     let mut last_sent = tokio::time::Instant::now() - Duration::from_secs(1);
+    let mut freshness_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        Duration::from_secs(1),
+    );
+    freshness_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             event = events.recv() => {
@@ -982,16 +987,10 @@ async fn stream_socket(socket: WebSocket, live: Arc<LiveManager>) {
                     Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
-                let elapsed = last_sent.elapsed();
-                if elapsed < Duration::from_millis(200) {
-                    tokio::time::sleep(Duration::from_millis(200) - elapsed).await;
-                }
-                let payload = match live.snapshot().await {
-                    Ok(snapshot) => serde_json::to_string(&snapshot).unwrap(),
-                    Err(error) => json!({"kind": "live_error", "detail": error.to_string()}).to_string(),
-                };
-                if sender.send(Message::Text(payload.into())).await.is_err() { break; }
-                last_sent = tokio::time::Instant::now();
+            }
+            _ = freshness_tick.tick() => {
+                // Reuse the cached analytics while aging freshness, even when
+                // the provider stops pushing. This does not advance sequence.
             }
             message = receiver.next() => {
                 match message {
@@ -1001,8 +1000,22 @@ async fn stream_socket(socket: WebSocket, live: Arc<LiveManager>) {
                     Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
                     _ => {}
                 }
+                continue;
             }
         }
+        let elapsed = last_sent.elapsed();
+        if elapsed < Duration::from_millis(200) {
+            tokio::time::sleep(Duration::from_millis(200) - elapsed).await;
+        }
+        let payload = match live.snapshot().await {
+            Ok(snapshot) => serde_json::to_string(&snapshot).unwrap(),
+            Err(error) => json!({"kind": "live_error", "detail": error.to_string()}).to_string(),
+        };
+        if sender.send(Message::Text(payload.into())).await.is_err() {
+            break;
+        }
+        last_sent = tokio::time::Instant::now();
+        freshness_tick.reset();
     }
 }
 
@@ -1171,4 +1184,81 @@ async fn main() -> anyhow::Result<()> {
         })
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod live_stream_tests {
+    use super::*;
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+    #[tokio::test]
+    async fn idle_longbridge_stream_heartbeats_and_exits_on_close() {
+        let live = LiveManager::new(0.043);
+        let (completed_tx, mut completed_rx) = tokio::sync::mpsc::channel(1);
+        let router = Router::new().route(
+            "/stream",
+            get(move |websocket: WebSocketUpgrade| {
+                let live = Arc::clone(&live);
+                let completed_tx = completed_tx.clone();
+                async move {
+                    websocket.on_upgrade(move |socket| async move {
+                        stream_socket(socket, live).await;
+                        let _ = completed_tx.send(()).await;
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+        // This local handshake uses a deterministic, public test nonce.
+        let request = format!(
+            concat!(
+                "GET /stream HTTP/1.1\r\nHost: localhost\r\n",
+                "Upgrade: websocket\r\nConnection: Upgrade\r\n",
+                "Sec-WebSocket-Key: {}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            ),
+            STANDARD.encode([0_u8; 16]),
+        );
+        socket.write_all(request.as_bytes()).await.unwrap();
+        let mut reader = BufReader::new(socket);
+        let payload = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            assert!(line.contains("101 Switching Protocols"));
+            loop {
+                line.clear();
+                reader.read_line(&mut line).await.unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            // No provider session exists and no events are sent. Only the
+            // heartbeat can deliver this frame through the normal error path.
+            assert_eq!(reader.read_u8().await.unwrap(), 0x81);
+            let length = reader.read_u8().await.unwrap();
+            assert!(length < 126);
+            let mut payload = vec![0; length as usize];
+            reader.read_exact(&mut payload).await.unwrap();
+            serde_json::from_slice::<Value>(&payload).unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(payload["kind"], "live_error");
+        // A masked empty Close frame must stop the heartbeat loop promptly.
+        reader
+            .get_mut()
+            .write_all(&[0x88, 0x80, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), completed_rx.recv())
+                .await
+                .unwrap(),
+            Some(())
+        );
+        server.abort();
+    }
 }

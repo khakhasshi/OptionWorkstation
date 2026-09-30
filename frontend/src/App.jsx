@@ -31,6 +31,7 @@ import ExecutionPanel from './components/ExecutionPanel'
 import { LiveReadout, Metric, Panel } from './components/Primitives'
 import StrategyWorkbench from './components/StrategyWorkbench'
 import { api, apiJson, websocketUrl } from './lib/api'
+import { createReplayController } from './lib/replay'
 
 const SurfaceChart = lazy(() => import('./components/SurfaceChart'))
 const AssistantDock = lazy(() => import('./components/AssistantDock'))
@@ -73,10 +74,11 @@ function App() {
   const [playing, setPlaying] = useState(false)
   const [speed, setSpeed] = useState(2)
   const [expiration, setExpiration] = useState('')
-  const [chain, setChain] = useState(null)
-  const [surface, setSurface] = useState(null)
-  const [volContext, setVolContext] = useState(null)
-  const [snapshotMeta, setSnapshotMeta] = useState(null)
+  const [liveChain, setChain] = useState(null)
+  const [liveSurface, setSurface] = useState(null)
+  const [liveVolContext, setVolContext] = useState(null)
+  const [liveSnapshotMeta, setSnapshotMeta] = useState(null)
+  const [replaySnapshot, setReplaySnapshot] = useState(null)
   const [pricingMode, setPricingMode] = useState('micro')
   const [dealerModel, setDealerModel] = useState('classic')
   const [smileAxis, setSmileAxis] = useState('strike')
@@ -127,9 +129,21 @@ function App() {
   const liveSequenceRef = useRef(-1)
   const pendingLiveSymbolRef = useRef(null)
   const liveRequestRef = useRef({ id: 0, controller: null, timer: null })
-  const replaySnapshotRequestRef = useRef({ id: 0, controller: null })
+  const replayControllerRef = useRef(null)
   const pendingWorkspaceFrameRef = useRef(null)
   const selectedConnection = liveProvider === 'thetadata' ? thetaConnection : connection
+  const replayContextKey = JSON.stringify([symbols, activeSymbol, tradingDate, expiration, pricingMode, dealerModel])
+  const visibleReplay = replaySnapshot?.contextKey === replayContextKey && replaySnapshot.session === session
+    ? replaySnapshot : null
+  const chain = mode === 'replay' ? visibleReplay?.data.chain || null : liveChain
+  const surface = mode === 'replay' ? visibleReplay?.data.surface || null : liveSurface
+  const volContext = mode === 'replay' ? visibleReplay?.data.volatility || null : liveVolContext
+  const snapshotMeta = mode === 'replay' && visibleReplay ? {
+    snapshot_id: visibleReplay.data.snapshot_id,
+    as_of: visibleReplay.data.as_of,
+    model_version: visibleReplay.data.model_version,
+  } : mode === 'live' ? liveSnapshotMeta : null
+  const displayedFrame = mode === 'replay' ? visibleReplay?.frame ?? -1 : frame
 
   const refreshAudit = useCallback(async () => {
     const records = await api('/api/audit/records?limit=50')
@@ -567,56 +581,46 @@ function App() {
     if (!expirations.includes(expiration)) setExpiration(expirations[0] || '')
   }, [activeSymbol, session])
 
-  const minute = session?.timeline[frame] || ''
+  const minute = session?.timeline[displayedFrame] || ''
   useEffect(() => {
-    if (mode !== 'replay' || !playing || !session) return undefined
-    const timer = window.setInterval(() => {
-      setFrame((current) => {
-        if (current >= session.timeline.length - 1) {
-          setPlaying(false)
-          return current
-        }
-        return current + 1
-      })
-    }, Math.max(32, 1000 / speed))
-    return () => window.clearInterval(timer)
-  }, [mode, playing, speed, session])
+    const controller = createReplayController({
+      load: (request, signal) => api(`/api/v1/replay/snapshot?${new URLSearchParams(request.params)}`, signal),
+      onCommit: (request, data) => {
+        setReplaySnapshot({ contextKey: request.contextKey, session: request.session, frame: request.frame, data })
+        setError('')
+      },
+      onFrame: setFrame,
+      onStop: () => setPlaying(false),
+      onError: (reason) => setError(reason.message),
+    })
+    replayControllerRef.current = controller
+    return () => {
+      controller.dispose()
+      replayControllerRef.current = null
+    }
+  }, [])
 
   useEffect(() => {
-    if (mode !== 'replay' || !minute || !expiration || !activeSymbol) return
-    const previous = replaySnapshotRequestRef.current
-    previous.controller?.abort()
-    const controller = new AbortController()
-    const requestId = previous.id + 1
-    replaySnapshotRequestRef.current = { id: requestId, controller }
-    const timer = window.setTimeout(() => {
-      const params = new URLSearchParams({
+    const requestedMinute = session?.timeline[frame]
+    const ready = mode === 'replay' && session?.date === tradingDate
+      && session?.symbols.join(',') === symbols.join(',')
+      && session?.series[activeSymbol]?.expirations.includes(expiration) && requestedMinute
+    replayControllerRef.current.update(ready ? {
+      contextKey: replayContextKey,
+      session,
+      frame,
+      lastFrame: session.timeline.length - 1,
+      params: {
         symbol: activeSymbol,
         date: tradingDate,
-        minute,
+        minute: requestedMinute,
         expiration,
         pricing_mode: pricingMode,
         dealer_model: dealerModel,
         max_dte: '180',
-      })
-      api(`/api/v1/replay/snapshot?${params.toString()}`, controller.signal)
-        .then((data) => {
-          if (replaySnapshotRequestRef.current.id !== requestId) return
-          setChain(data.chain || null)
-          setSurface(data.surface || null)
-          setVolContext(data.volatility || null)
-          setSnapshotMeta({ snapshot_id: data.snapshot_id, as_of: data.as_of, model_version: data.model_version })
-          setError('')
-        })
-        .catch((reason) => {
-          if (reason.name !== 'AbortError' && replaySnapshotRequestRef.current.id === requestId) setError(reason.message)
-        })
-    }, playing ? 100 : 0)
-    return () => {
-      window.clearTimeout(timer)
-      controller.abort()
-    }
-  }, [mode, activeSymbol, tradingDate, minute, expiration, pricingMode, dealerModel, playing])
+      },
+    } : null, { playing, speed })
+  }, [mode, session, replayContextKey, frame, playing, speed])
 
   useEffect(() => {
     if (mode !== 'live' || !liveFeed || liveFeed.expiration !== expiration || !selectedConnection.connected) return undefined
@@ -639,13 +643,13 @@ function App() {
   }, [mode, activeSymbol, expiration, pricingMode, dealerModel, strategyQuantity, strategyLegs])
 
   const currentBars = useMemo(() => {
-    if (!session) return {}
-    return Object.fromEntries(symbols.filter((symbol) => session.series[symbol]).map((symbol) => [symbol, session.series[symbol].bars.slice(0, frame + 1)]))
-  }, [session, symbols, frame])
+    if (!session || displayedFrame < 0) return {}
+    return Object.fromEntries(symbols.filter((symbol) => session.series[symbol]).map((symbol) => [symbol, session.series[symbol].bars.slice(0, displayedFrame + 1)]))
+  }, [session, symbols, displayedFrame])
 
   const marketOption = useMemo(() => {
-    if (!session) return null
-    const times = session.timeline.slice(0, frame + 1)
+    if (!session || displayedFrame < 0) return null
+    const times = session.timeline.slice(0, displayedFrame + 1)
     if (symbols.length > 1) {
       return {
         animation: false,
@@ -675,7 +679,7 @@ function App() {
         { name: 'Volume', type: 'bar', xAxisIndex: 1, yAxisIndex: 1, data: bars.map((bar) => bar.volume), itemStyle: { color: '#334655' } },
       ],
     }
-  }, [session, symbols, activeSymbol, currentBars, frame, focusStrike])
+  }, [session, symbols, activeSymbol, currentBars, displayedFrame, focusStrike])
 
   const smileOption = useMemo(() => {
     if (!chain) return null
@@ -887,7 +891,7 @@ function App() {
       kind: 'option_workstation_export',
       exported_at: new Date().toISOString(),
       workspace_id: workspaceId || null,
-      workspace: { mode, symbols, activeSymbol, tradingDate, frame, minute, expiration, pricingMode, dealerModel, layout, smileAxis, strategyLegs, strategyQuantity },
+      workspace: { mode, symbols, activeSymbol, tradingDate, frame: displayedFrame, minute, expiration, pricingMode, dealerModel, layout, smileAxis, strategyLegs, strategyQuantity },
       snapshot: snapshotMeta,
       chain,
       surface,
@@ -904,6 +908,7 @@ function App() {
   }
 
   const saveWorkspace = () => {
+    if (mode === 'replay' && !visibleReplay) return
     const defaultName = `${activeSymbol} ${tradingDate || 'live'} ${minute || ''}`.trim()
     const name = window.prompt('为当前研究工作区命名', defaultName)
     if (!name?.trim()) return
@@ -916,7 +921,7 @@ function App() {
       symbols,
       activeSymbol,
       tradingDate,
-      frame,
+      frame: displayedFrame,
       expiration,
       pricingMode,
       dealerModel,
@@ -972,7 +977,7 @@ function App() {
     if (preset === 'iron_condor') setStrategyLegs([leg(find('PUT', spot * 0.94), 'BUY'), leg(find('PUT', spot * 0.97), 'SELL'), leg(find('CALL', spot * 1.03), 'SELL'), leg(find('CALL', spot * 1.06), 'BUY')])
   }
 
-  const activeBar = session?.series[activeSymbol]?.bars[frame]
+  const activeBar = session?.series[activeSymbol]?.bars[displayedFrame]
   const quotePermission = liveProvider === 'thetadata'
     ? (thetaConnection.quote_level || 'ThetaData snapshots')
     : connection.quote_level?.includes('USO') ? 'US Options LV1' : (connection.quote_level ? 'OpenAPI Quotes' : '等待凭证')

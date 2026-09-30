@@ -24,6 +24,14 @@ and releases use semantic versioning after the public API stabilizes.
 
 ### Fixed
 
+- Replay playback waits for each complete snapshot and commits the tape time,
+  option chain, surface, and volatility context together. Slow requests reduce
+  effective playback speed instead of leaving analytics on an old frame.
+- Cached Longbridge snapshots refresh quote ages and freshness coverage on
+  every read, so a stalled feed cannot keep an old paper preview executable;
+  idle WebSocket clients receive freshness updates without new provider events.
+- Historical OI coverage is measured against quoted contracts with valid OI
+  observations, including known zeroes, instead of the existence of an OI file.
 - Live expiration changes remain selected while the previous stream continues,
   then update the full workspace only after the provider confirms the new
   expiration.

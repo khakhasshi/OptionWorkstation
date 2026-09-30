@@ -11,6 +11,7 @@ python3 -m pytest -q "$ROOT/tests/test_thetadata_adapter.py"
 if [[ ! -d "$ROOT/frontend/node_modules" ]]; then
   (cd "$ROOT/frontend" && npm ci)
 fi
+(cd "$ROOT/frontend" && npm test)
 (cd "$ROOT/frontend" && npm run build)
 
 if curl -fsS "$BASE_URL/api/health" >/dev/null 2>&1; then

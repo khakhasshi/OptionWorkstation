@@ -37,6 +37,8 @@ prices without saying which is which. Option Workstation keeps those layers
 visible:
 
 - historical replay reads point-in-time local ThetaData Parquet partitions;
+- replay speed is a target ceiling: each frame waits for its complete snapshot,
+  keeping the tape and analytics synchronized even when requests are slow;
 - live mode selects either official Longbridge Rust SDK streaming or official
   ThetaData Python SDK snapshot polling and reports transport and freshness;
 - bid/ask availability, quote age, and metadata coverage remain explicit;

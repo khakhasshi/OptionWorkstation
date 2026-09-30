@@ -264,6 +264,7 @@ impl ReplayStore {
         let expiry = NaiveDate::parse_from_str(expiration, "%Y-%m-%d")?;
         let quotes = self.option_quotes(&clean, trading_date, expiration, minute)?;
         anyhow::ensure!(!quotes.is_empty(), "No option quotes at {minute}");
+        let oi = self.open_interest(&clean, trading_date, expiration)?;
         build_chain(ChainBuild {
             symbol: &clean,
             spot: self.spot_at(&clean, trading_date, minute)?,
@@ -279,15 +280,7 @@ impl ReplayStore {
             prefer_sdk_greeks: false,
             quote_coverage: 100.0,
             fresh_quote_coverage: 100.0,
-            metadata_coverage: if self
-                .option_day_dir(&clean, trading_date)
-                .join(format!("expiration={expiration}/open_interest.parquet"))
-                .is_file()
-            {
-                100.0
-            } else {
-                0.0
-            },
+            metadata_coverage: open_interest_coverage(&quotes, &oi),
             spot_age_ms: Some(0),
         })
     }
@@ -662,7 +655,13 @@ fn read_open_interest(path: &Path) -> anyhow::Result<OiMap> {
         let right = TextColumn::from_batch(&batch, "right")?;
         let oi = typed::<Int64Array>(&batch, "open_interest")?;
         for row in 0..batch.num_rows() {
-            if strike.is_null(row) || right.is_null(row) || oi.is_null(row) {
+            if strike.is_null(row)
+                || right.is_null(row)
+                || oi.is_null(row)
+                || !strike.value(row).is_finite()
+                || strike.value(row) <= 0.0
+                || oi.value(row) < 0
+            {
                 continue;
             }
             values.insert(
@@ -675,6 +674,20 @@ fn read_open_interest(path: &Path) -> anyhow::Result<OiMap> {
         }
     }
     Ok(values)
+}
+
+fn open_interest_coverage(quotes: &[RawOptionQuote], oi: &OiMap) -> f64 {
+    let contracts: HashSet<_> = quotes
+        .iter()
+        .map(|quote| ((quote.strike * 1000.0).round() as i64, quote.right.clone()))
+        .collect();
+    if contracts.is_empty() {
+        return 0.0;
+    }
+    // A reported zero is known metadata; a missing/null observation is not.
+    // Match only contracts quoted at this replay minute, never a file's row count.
+    let available = contracts.iter().filter(|key| oi.contains_key(*key)).count();
+    available as f64 / contracts.len() as f64 * 100.0
 }
 
 fn read_option_quotes(
@@ -755,7 +768,231 @@ fn read_option_quotes(
 
 #[cfg(test)]
 mod tests {
-    use super::point_in_time_history_minute;
+    use super::*;
+    use arrow_array::ArrayRef;
+    use parquet::arrow::ArrowWriter;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const DATE: &str = "2026-06-01";
+    const EXPIRATION: &str = "2026-06-12";
+    const MINUTE: &str = "09:31";
+    static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+    struct ReplayFixture {
+        store: ReplayStore,
+    }
+
+    impl ReplayFixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "option-workstation-replay-{}-{}-{}",
+                std::process::id(),
+                Utc::now().timestamp_nanos_opt().unwrap(),
+                NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed),
+            ));
+            let store = ReplayStore::new(root, 0.04);
+            let timestamp = replay_as_of(DATE, MINUTE).unwrap().timestamp_micros();
+            write_parquet(
+                &store
+                    .symbol_dir("TEST")
+                    .join(format!("date={DATE}/ohlc.parquet")),
+                vec![
+                    (
+                        "timestamp",
+                        Arc::new(TimestampMicrosecondArray::from(vec![timestamp])),
+                    ),
+                    ("open", Arc::new(Float64Array::from(vec![100.0]))),
+                    ("high", Arc::new(Float64Array::from(vec![100.0]))),
+                    ("low", Arc::new(Float64Array::from(vec![100.0]))),
+                    ("close", Arc::new(Float64Array::from(vec![100.0]))),
+                    ("volume", Arc::new(Int64Array::from(vec![1_000]))),
+                    ("vwap", Arc::new(Float64Array::from(vec![100.0]))),
+                ],
+            );
+            write_parquet(
+                &store
+                    .option_day_dir("TEST", DATE)
+                    .join(format!("expiration={EXPIRATION}/quote_1m.parquet")),
+                vec![
+                    (
+                        "timestamp",
+                        Arc::new(TimestampMicrosecondArray::from(vec![timestamp; 2])),
+                    ),
+                    ("strike", Arc::new(Float64Array::from(vec![100.0; 2]))),
+                    ("right", Arc::new(StringArray::from(vec!["CALL", "PUT"]))),
+                    ("bid_size", Arc::new(Int64Array::from(vec![10; 2]))),
+                    ("ask_size", Arc::new(Int64Array::from(vec![10; 2]))),
+                    ("bid", Arc::new(Float64Array::from(vec![2.0; 2]))),
+                    ("ask", Arc::new(Float64Array::from(vec![2.2; 2]))),
+                ],
+            );
+            Self { store }
+        }
+
+        fn oi(&self, date: &str, rows: &[(f64, &str, Option<i64>)]) {
+            write_parquet(
+                &self
+                    .store
+                    .option_day_dir("TEST", date)
+                    .join(format!("expiration={EXPIRATION}/open_interest.parquet")),
+                vec![
+                    (
+                        "strike",
+                        Arc::new(Float64Array::from(
+                            rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+                        )),
+                    ),
+                    (
+                        "right",
+                        Arc::new(StringArray::from(
+                            rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+                        )),
+                    ),
+                    (
+                        "open_interest",
+                        Arc::new(Int64Array::from(
+                            rows.iter().map(|row| row.2).collect::<Vec<_>>(),
+                        )),
+                    ),
+                ],
+            );
+        }
+
+        fn chain(&self) -> ChainSnapshot {
+            self.store
+                .chain("TEST", DATE, MINUTE, EXPIRATION, "mid", "classic")
+                .unwrap()
+        }
+    }
+
+    impl Drop for ReplayFixture {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(self.store.root()).unwrap();
+        }
+    }
+
+    fn write_parquet(path: &Path, columns: Vec<(&str, ArrayRef)>) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let batch = RecordBatch::try_from_iter(columns).unwrap();
+        let mut writer =
+            ArrowWriter::try_new(File::create(path).unwrap(), batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    fn assert_gex_blocked(chain: &ChainSnapshot, coverage: f64) {
+        assert_eq!(chain.rows.len(), 2);
+        assert_eq!(chain.quality.metadata_coverage_pct, coverage);
+        assert!(!chain.quality.gex_ready);
+        assert_eq!(chain.metrics.net_gex, None);
+        assert_eq!(chain.metrics.call_oi, None);
+        assert_eq!(chain.metrics.put_oi, None);
+        assert!(chain.rows.iter().all(|row| row.gex.is_none()));
+        assert!(chain.dealer_scenarios.is_empty());
+        assert!(chain.gex_by_strike.is_empty());
+        assert!(
+            chain
+                .quality
+                .blocked_metrics
+                .iter()
+                .any(|metric| metric == "net_gex")
+        );
+    }
+
+    #[test]
+    fn missing_oi_does_not_borrow_another_days_metadata() {
+        let fixture = ReplayFixture::new();
+        let complete = [(100.0, "CALL", Some(10)), (100.0, "PUT", Some(20))];
+        fixture.oi("2026-05-29", &complete);
+        fixture.oi("2026-06-02", &complete);
+        assert_gex_blocked(&fixture.chain(), 0.0);
+    }
+
+    #[test]
+    fn empty_or_null_oi_file_does_not_unlock_gex() {
+        for rows in [vec![], vec![(100.0, "CALL", None), (100.0, "PUT", None)]] {
+            let fixture = ReplayFixture::new();
+            fixture.oi(DATE, &rows);
+            assert_gex_blocked(&fixture.chain(), 0.0);
+        }
+    }
+
+    #[test]
+    fn oi_coverage_matches_quoted_contracts_and_counts_known_zero() {
+        let fixture = ReplayFixture::new();
+        fixture.oi(
+            DATE,
+            &[
+                (100.0, "CALL", Some(0)),
+                (100.0, "PUT", None),
+                (105.0, "CALL", Some(500)),
+            ],
+        );
+        let chain = fixture.chain();
+        assert_gex_blocked(&chain, 50.0);
+        let oi = fixture
+            .store
+            .open_interest("TEST", DATE, EXPIRATION)
+            .unwrap();
+        assert_eq!(oi.get(&(100_000, "CALL".into())), Some(&0));
+        assert!(!oi.contains_key(&(100_000, "PUT".into())));
+
+        // Repeated quotes for a known contract must not inflate its coverage.
+        let quotes = fixture
+            .store
+            .option_quotes("TEST", DATE, EXPIRATION, MINUTE)
+            .unwrap();
+        let mut repeated = quotes.as_ref().clone();
+        repeated.push(quotes[0].clone());
+        assert_eq!(open_interest_coverage(&repeated, &oi), 50.0);
+    }
+
+    #[test]
+    fn complete_oi_including_zero_unlocks_gex() {
+        let fixture = ReplayFixture::new();
+        fixture.oi(DATE, &[(100.0, "CALL", Some(0)), (100.0, "PUT", Some(25))]);
+        let chain = fixture.chain();
+        assert_eq!(chain.rows.len(), 2);
+        assert_eq!(chain.quality.metadata_coverage_pct, 100.0);
+        assert!(chain.quality.gex_ready);
+        assert_eq!(chain.metrics.call_oi, Some(0));
+        assert_eq!(chain.metrics.put_oi, Some(25));
+        assert!(chain.metrics.net_gex.is_some());
+        assert!(chain.quality.blocked_metrics.is_empty());
+        assert!(chain.rows.iter().all(|row| row.gex.is_some()));
+        assert_eq!(
+            chain
+                .rows
+                .iter()
+                .find(|row| row.right == "CALL")
+                .unwrap()
+                .gex,
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn invalid_oi_observations_are_not_metadata_coverage() {
+        let fixture = ReplayFixture::new();
+        fixture.oi(
+            DATE,
+            &[
+                (100.0, "CALL", Some(-1)),
+                (100.0, "PUT", None),
+                (f64::NAN, "CALL", Some(10)),
+                (f64::INFINITY, "CALL", Some(10)),
+                (0.0, "CALL", Some(10)),
+            ],
+        );
+        assert!(
+            fixture
+                .store
+                .open_interest("TEST", DATE, EXPIRATION)
+                .unwrap()
+                .is_empty()
+        );
+        assert_gex_blocked(&fixture.chain(), 0.0);
+    }
 
     #[test]
     fn historical_iv_never_looks_ahead_of_early_replay_time() {

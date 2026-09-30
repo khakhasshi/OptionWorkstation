@@ -65,6 +65,17 @@ cargo test --locked --manifest-path rust-backend/Cargo.toml
 These cover model calculations, safety gates, redaction, and point-in-time
 helpers without provider data.
 
+### Replay Playback Tests
+
+```bash
+cd frontend
+npm test
+```
+
+These use a controlled clock and deferred responses to exercise fast playback,
+slow requests, cancellation, and snapshot consistency without licensed data or
+provider credentials. They also run in CI and `make check`.
+
 ### Legacy Python Tests
 
 ```bash
@@ -134,6 +145,7 @@ The gate includes:
 - `cargo fmt --check`;
 - `cargo test --locked`;
 - `cargo clippy --locked --all-targets -- -D warnings`;
+- deterministic frontend replay tests;
 - frontend production build;
 - running-server API smoke checks when available;
 - private path, market-data, oversized artifact, and secret scans.

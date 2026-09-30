@@ -79,6 +79,12 @@ Open interest is daily metadata. The operator is responsible for ensuring that
 the file's publication timestamp is valid for the replay timestamp. A same-date
 partition name alone does not prove point-in-time availability.
 
+Replay metadata coverage is the share of unique quoted contracts at the active
+minute with a valid matching OI observation. An observed zero counts as covered;
+missing, null, or invalid observations do not. An empty or partially populated
+file cannot imply complete coverage. OI-dependent aggregate metrics remain
+unavailable when coverage is below 90%.
+
 ## Point-in-Time Rules
 
 - A replay request must use a date partition that exists for the symbol.
@@ -104,6 +110,13 @@ Live mode uses the official Longbridge Rust SDK for:
 Provider permissions and endpoint limits vary by account and market. The live
 engine keeps quote freshness and slower OI/volume metadata coverage separate.
 Unavailable metadata must not be interpreted as zero inventory.
+
+Cached price analytics retain their observation timestamps, while each snapshot
+read recalculates quote ages and freshness coverage. Quote ages continue to
+increase without new provider events, including during a system-clock rollback.
+The paper-order preview check uses this current freshness assessment.
+Idle WebSocket clients receive a freshness update every second without changing
+the observation timestamp or provider event sequence.
 
 Longbridge aggregate option data is not a substitute for a historical full-chain
 NBBO replay dataset. A backtest claiming executable historical fills needs the
