@@ -15,7 +15,7 @@ COPY vendor/ ./vendor/
 COPY rust-backend/ ./rust-backend/
 RUN cargo build --locked --release --manifest-path rust-backend/Cargo.toml
 
-FROM python:3.12-slim-bookworm AS runtime
+FROM python:3.14-slim-bookworm AS runtime
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends ca-certificates curl libssl3 \
     && rm -rf /var/lib/apt/lists/* \
